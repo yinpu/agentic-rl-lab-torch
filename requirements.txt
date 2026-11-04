@@ -1,0 +1,8 @@
+# PyTorch 的 CUDA wheel 安装方法见 experiments/grpo/README.md。
+torch==2.10.0
+transformers==5.22.1
+peft==0.21.2
+accelerate==1.15.0
+datasets==5.1.0
+modelscope==1.40.2
+pytest==9.2.0
