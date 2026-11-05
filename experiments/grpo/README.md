@@ -12,26 +12,19 @@
 - `test_grpo.py`：不下载权重的算法与接口检查。
 - `test_grpo_gpu.py`：使用缓存的真实模型，在单张 GPU 上检查四种配置的更新与保存重载。
 
-## 环境和模型
+## 先沿公式阅读代码
 
-整个项目使用根目录的 `.venv`。Python 3.12，依赖版本固定在根目录 `requirements.txt`。以下 CUDA 12.8 安装命令针对本机 NVIDIA 环境；服务器按其驱动选择官方 PyTorch wheel。
+本章只维护一套训练实现。下面引用的代码都来自实际参与训练的函数，可以直接修改这些函数开展实验。
 
-```bash
-python -m venv .venv
-.venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
-.venv/bin/python -m pip install -r requirements.txt
-```
+| 阅读顺序 | 数学量或操作 | 实际代码 |
+| --- | --- | --- |
+| 1. 给回答打分 | $r_i$ | [task.py](task.py) 的 `training_rewards` |
+| 2. 同题回答相互比较 | $A_i$ | [task.py](task.py) 的 `group_advantages` |
+| 3. 取得回答 token 的概率 | $\log\pi$ | [task.py](task.py) 的 `completion_logprobs` |
+| 4. 计算概率比、裁剪和可选 KL | $\rho$、$\ell_{i,t}$ | [task.py](task.py) 的 `grpo_loss` |
+| 5. 累积梯度并更新 LoRA | $\nabla_\theta L$ | [train.py](train.py) 的 `update_policy` |
 
-从 ModelScope 下载本章当前选定的基础模型：
-
-```bash
-.venv/bin/python -c 'from modelscope import snapshot_download; snapshot_download("Qwen/Qwen2.5-0.5B", local_dir=".cache/models/Qwen2.5-0.5B")'
-```
-
-默认从这个本地路径加载。[Qwen2.5-0.5B 官方说明](https://huggingface.co/Qwen/Qwen2.5-0.5B)将它标为约 0.49B 参数、仅预训练的基础模型，不是 Instruct 或推理蒸馏版。通过 `AutoModelForCausalLM` 加载，实际模型类为 `Qwen2ForCausalLM`。`--model` 也接受本地目录或 Hugging Face 模型名，方便在服务器上指定模型位置。
-
-GSM8K 首次运行由 Datasets 自动下载到 `.cache/datasets`。缓存、`.venv` 和 `runs` 不进入版本控制。本章不需要 PyTRIO、训练 API、vLLM 或额外训练服务。
+`train.py::rollout` 串起采样、奖励、优势与旧概率缓存；`main` 串起采样、更新和评测。可以先读下面的算法主线，再看后面的环境、运行与工程说明。
 
 ## 从一道题开始
 
@@ -63,6 +56,16 @@ Problem:
 \[
 r_i=c_i+\lambda f_i.
 \]
+
+对应 `training_rewards` 中实际执行的计算：
+
+```python
+correct = reward(text, answer)
+think_format = follows_think_format(text)
+format_reward = format_reward_weight * float(think_format)
+```
+
+返回记录中的 `reward` 为 `correct + format_reward`，供组内优势计算使用。
 
 `--format-reward-weight 0` 对应当前基线；设为 `0.5` 时，格式合规额外得 0.5 分，总奖励范围为 0 到 1.5。这只是对照实验的起始权重，尚未训练验证。
 
@@ -100,6 +103,13 @@ advantages = rewards - rewards.mean()
 A_i=\frac{r_i-\bar r}{\operatorname{std}(r_1,\ldots,r_G)+10^{-8}}.
 \]
 
+`group_advantages` 中的可选分支为：
+
+```python
+if standardize:
+    advantages = advantages / (rewards.std(correction=0) + 1e-8)
+```
+
 用 `--standardize-advantages` 启用，代码采用总体标准差 `correction=0`，上例得到 `[1, -1, 1, -1]`。这是显式算法选择，不是依赖训练库默认值。所有奖励相同时，两种方式都得到零优势。
 
 ## 采样后，固定旧策略的概率
@@ -108,12 +118,11 @@ A_i=\frac{r_i-\bar r}{\operatorname{std}(r_1,\ldots,r_G)+10^{-8}}.
 
 训练采样固定 temperature=1、top-p=1、top-k=0、repetition penalty=1。新建 `GenerationConfig`，避免模型仓库默认配置改变采样分布。模型与 LoRA 的 dropout 均为 0；采样、概率计算和独立评测均使用相同精度的 autocast。
 
-概率比为：
+`rollout` 在无梯度上下文中缓存旧概率：
 
-\[
-\rho_{i,t}=\exp\bigl(\log\pi_\theta(o_{i,t}\mid q,o_{i,<t})
--\log\pi_{\mathrm{old}}(o_{i,t}\mid q,o_{i,<t})\bigr).
-\]
+```python
+old = completion_logprobs(model, prompt, tokens).cpu()
+```
 
 这里的 old policy 是本批采样时的策略。它与后文的固定 reference 不同。
 
@@ -129,7 +138,34 @@ A_i=\frac{r_i-\bar r}{\operatorname{std}(r_1,\ldots,r_G)+10^{-8}}.
 
 `task.py::completion_logprobs` 把 `prompt + completion[:-1]` 输入模型，取最后 `len(completion)` 个输出位置，再取目标 token 的 logprob。`logits_to_keep` 只保留所需位置，减少大词表 logits 的占用。
 
+对应的模型前向与取概率代码为（`inputs` 是上述输入，`targets` 是 completion）：
+
+```python
+output = model(input_ids=inputs, attention_mask=torch.ones_like(inputs),
+               use_cache=False, logits_to_keep=len(completion))
+logits = output.logits[0]  # [T, V]，V 为词表大小；targets 为 [T]。
+```
+
+函数返回 `-F.cross_entropy(logits.float(), targets, reduction="none")`：单 token 交叉熵为 $-\log\pi$，取负即得到每个目标 token 的 logprob；转 FP32 用于概率计算的数值稳定性。
+
 每次 forward 只处理一条未 padding 的回答，因此不需要在 loss 里构造大批次的 prompt/padding mask：返回的整个向量正好对应有效 completion。`trim_completion` 保留首个 EOS，删除其后的 padding；达到生成上限但未遇到 EOS 的回答仍保留，另行记录截断率。
+
+## 新旧策略的概率比
+
+概率比为：
+
+\[
+\rho_{i,t}=\exp\bigl(\log\pi_\theta(o_{i,t}\mid q,o_{i,<t})
+-\log\pi_{\mathrm{old}}(o_{i,t}\mid q,o_{i,<t})\bigr).
+\]
+
+对应 `grpo_loss` 的第一步：
+
+```python
+ratio = torch.exp(logprobs - old_logprobs)
+```
+
+`logprobs` 来自更新时的当前策略，保留梯度；`old_logprobs` 是 rollout 缓存的固定值。
 
 ## Clipped 策略目标直接写出来
 
@@ -177,11 +213,61 @@ L=\frac{1}{N}\sum_{i=1}^{N}\frac{1}{T_i}\sum_{t=1}^{T_i}\ell_{i,t}.
 \quad \ell_{i,t}=\ell_{i,t}^{\mathrm{policy}}+\beta\widehat D_{i,t}.
 \]
 
+`grpo_loss` 在 `beta` 非零时执行：
+
+```python
+delta = ref_logprobs - logprobs
+kl = torch.exp(delta) - delta - 1
+loss = (policy + beta * kl).mean()
+```
+
+关闭 KL 时则执行 `loss = policy.mean()`。这两个分支都先平均一条回答的有效 token。
+
 基础模型冻结，LoRA 默认零增量初始化。关闭适配器计算 reference logprob，就得到训练初始策略，不需要再放一整份模型。reference 始终固定，old 则每批刷新。
 
 KL 直接加入 loss，不混进奖励再计算组内优势。它是采样 token 上的估计量，不是对整个词表精确求和的 KL。
 
 总奖励全相同的组保留在损失分母中；它们没有奖励优势，但在 beta>0 时仍可产生 KL 约束。仅正确性奖励时，全对或全错的组都是这种情况；开启格式奖励后，格式差异也可能产生优势。beta=0 且整个全局批次没有优势信号时，跳过 optimizer step，避免 Adam 历史动量继续改变参数。采样批次数与实际优化步数分别记录。
+
+## 从 loss 到参数更新
+
+`train.py::update_policy` 对每条回答重新计算当前策略概率，随后调用上面的同一个 `grpo_loss`：
+
+```python
+current = completion_logprobs(model, sample["prompt"], sample["tokens"])
+```
+
+`old` 和可选的 `reference` 从 rollout 记录搬到当前设备后，传给：
+
+```python
+loss, metrics = grpo_loss(current, old, sample["advantage"], reference,
+                          args.beta if real else 0.0, args.clip)
+```
+
+单进程时，每条真实回答的 loss 乘 $1/N$，再调用 `accelerator.backward(loss * weight)`。所有回答反传完才统一裁剪梯度、检查有限性并执行 `optimizer.step()`。因此两个平均分别位于 `grpo_loss` 的 `.mean()` 和 `update_policy` 的回答权重中，不是每条回答更新一次参数。
+
+主循环中 `updates_per_batch` 次更新复用本批回答及固定的 old/reference；下一批才重新采样。无奖励优势且没有 KL 时跳过更新，采样批次数与实际优化步数分别记录。
+
+## 环境和模型
+
+整个项目使用根目录的 `.venv`。Python 3.12，依赖版本固定在根目录 `requirements.txt`。以下 CUDA 12.8 安装命令针对本机 NVIDIA 环境；服务器按其驱动选择官方 PyTorch wheel。
+
+```bash
+python -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+从 ModelScope 下载本章当前选定的基础模型：
+
+```bash
+.venv/bin/python -c 'from modelscope import snapshot_download; snapshot_download("Qwen/Qwen2.5-0.5B", local_dir=".cache/models/Qwen2.5-0.5B")'
+```
+
+默认从这个本地路径加载。[Qwen2.5-0.5B 官方说明](https://huggingface.co/Qwen/Qwen2.5-0.5B)将它标为约 0.49B 参数、仅预训练的基础模型，不是 Instruct 或推理蒸馏版。通过 `AutoModelForCausalLM` 加载，实际模型类为 `Qwen2ForCausalLM`。`--model` 也接受本地目录或 Hugging Face 模型名，方便在服务器上指定模型位置。
+
+GSM8K 首次运行由 Datasets 自动下载到 `.cache/datasets`。缓存、`.venv` 和 `runs` 不进入版本控制。本章不需要 PyTRIO、训练 API、vLLM 或额外训练服务。
 
 ## 数据划分与运行
 
@@ -219,16 +305,7 @@ KL 直接加入 loss，不混进奖励再计算组内优势。它是采样 token
 
 `--steps 0`（默认）遍历排除验证题后的训练集一遍。`--train-limit N` 取其中前 N 题；`--steps N` 限制采样批次数，不会循环重复数据凑步数。`--batch-size` 是**每进程题数**，不是回答数；一次全局完整批次有 `进程数 × batch-size × group-size` 条回答。
 
-多卡使用同一入口：
-
-```bash
-.venv/bin/torchrun --standalone --nproc_per_node=2 experiments/grpo/train.py \
-  --output runs/qwen05-ddp --batch-size 2 --group-size 8 --eval-limit 0
-```
-
-这是 DDP，每卡各有完整基础模型，不会把模型显存分摊到多张卡。完整采样组留在同一进程；最后不足整批时，只用真实回答数归一化。空槽做零权重计算以维持 DDP 同步，不重复计入样本或评测。梯度乘 `进程数 / 全局真实回答数`，抵消 DDP 的进程平均。
-
-训练产物保存在 `--output`：配置与实际任务指令、依赖版本、划分索引、训练 JSONL、实际 rollout、训练前后逐题验证结果，以及最终的 `adapter/`。每次定期验证前还会保存 `adapter-batch-N/`，可用 `evaluate.py --adapter` 单独评测；检查点仅含模型适配器与 tokenizer，不含优化器或随机数状态，不支持完整恢复训练。评测逐题写入 `*.rank-N.jsonl`，完整结束后汇总为 JSON；中止时已完成的题目仍保留，但未实现自动断点续评。使用新目录启动，避免覆盖旧实验。
+多卡启动、梯度同步和训练产物见后面的“工程说明”。
 
 重新加载保存的 LoRA，验证保存链路：
 
@@ -297,6 +374,30 @@ KL 直接加入 loss，不混进奖励再计算组内优势。它是采样 token
 本实现与参考的明确差异：采用 Qwen2.5-0.5B 预训练基础模型和无示例的 think 格式指令；本地文本模型训练替代远程服务；明确选择 LoRA alpha=64、all-linear、dropout=0；只实现 clipped 策略目标；按回答等权归约；保留退化组；增加验证划分、独立贪心评测、可选 KL、可选格式奖励和梯度裁剪。参考远程服务的 LoRA 层选择、内置 loss 归约和梯度缩放未在客户端完整公开，因此不宣称数值等价。
 
 这里要区分三件事：流程能够运行、参考任务上的本地实验、原论文指标复现。前者不能替代后两者。实际验证状态见本目录 `validation.md`；未执行的配置不写成已验证。
+
+## 工程说明：多卡、精度与保存
+
+多卡使用同一入口：
+
+```bash
+.venv/bin/torchrun --standalone --nproc_per_node=2 experiments/grpo/train.py \
+  --output runs/qwen05-ddp --batch-size 2 --group-size 8 --eval-limit 0
+```
+
+这是 DDP，每卡各有完整基础模型，不会把模型显存分摊到多张卡。完整采样组留在同一进程；最后不足整批时，只用真实回答数归一化。空槽做零权重计算以维持 DDP 同步，不重复计入样本或评测。梯度乘 `进程数 / 全局真实回答数`，抵消 DDP 的进程平均。
+
+`train.py` 将这些协调工作留在本章内部的小函数里：
+
+- `pad_samples`：尾批补齐同步槽位，真实回答数在调用前保存。
+- `should_update`：归约各进程的优势信号，让所有进程共同更新或共同跳过；有 KL 时仍更新。
+- `log_batch`：只收集真实回答，汇总并写入日志；占位项不进入指标。
+- `save_adapter`：仅主进程保存适配器与 tokenizer，调用方安排同步。
+
+`update_policy` 中，前面的回答使用 `no_sync` 在本地累积，最后一条反传才同步。若全局有 $N$ 条真实回答、$W$ 个进程，每条真实回答的权重为 $W/N$，占位项为 0；DDP 再对进程梯度求平均，得到 $\frac{1}{N}\sum_i\nabla L_i$。单进程时自然退化为 $1/N$。这是回答平均在多进程下的实现，不改变前面定义的目标。
+
+模型加载时关闭 dropout，LoRA dropout 也为 0。BF16/FP32 由参数选择，Accelerate 负责训练前向的精度；绕过包装器的采样与评测显式使用同样的 autocast。梯度检查点通过反传时重算激活减少显存占用。逐回答反传避免保留整批计算图，但批处理效率受限。
+
+训练产物保存在 `--output`：配置与实际任务指令、依赖版本、划分索引、训练 JSONL、实际 rollout、训练前后逐题验证结果，以及最终的 `adapter/`。每次定期验证前还会保存 `adapter-batch-N/`，可用 `evaluate.py --adapter` 单独评测；检查点仅含模型适配器与 tokenizer，不含优化器或随机数状态，不支持完整恢复训练。评测逐题写入 `*.rank-N.jsonl`，完整结束后汇总为 JSON；中止时已完成的题目仍保留，但未实现自动断点续评。使用新目录启动，避免覆盖旧实验。
 
 ## 算法检查
 

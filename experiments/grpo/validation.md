@@ -120,3 +120,23 @@ OMP_NUM_THREADS=4 HF_HUB_OFFLINE=1 .venv/bin/python experiments/grpo/train.py \
 ## 代码清理后的回归检查
 
 完整评测前，15 项离线检查通过。现有 16 题基线的实际输入提示词逐字一致；单题 GPU 回归的回答、token 数与判分也与原结果完全一致，产物保存在 `runs/qwen05-cleanup-check/`。随后完成了上文记录的完整验证集评测。
+
+
+## 公式阅读与训练入口整理后的检查
+
+本次仅整理代码与教程：优势、token logprob、clipping、KL 及逐回答更新的计算保持原样；尾批补齐、全局更新判断、日志和 adapter 保存提取到 `train.py` 的本章辅助函数。README 增加公式到实际函数的阅读顺序及代码摘录，多卡、精度和保存说明集中到后文。命令行参数、默认值、输出字段和既有实验设置保持不变。
+
+本次使用 `CUDA_VISIBLE_DEVICES=''`、`OMP_NUM_THREADS=2`、`HF_HUB_OFFLINE=1`，执行以下有限检查：
+
+```bash
+.venv/bin/python -m pytest experiments/grpo/test_grpo.py -q \
+  -k 'group_advantages or positive_and_negative or clip_uses or kl_zero or eos_is or autoregressive_alignment or rollout_combines'
+.venv/bin/torchrun --standalone --nproc_per_node=2 experiments/grpo/test_grpo.py
+```
+
+- 相关离线测试 **13 项通过，17 项未选中**，覆盖四种奖励/KL 组合的 rollout、组内优势、正负优势梯度、clipping、KL、EOS 与自回归对齐。
+- CPU 双进程检查通过：全局 3 题时各进程题数不齐、全局 1 题时一个进程无真实回答，使用实际 `pad_samples` 和 `update_policy` 得到的参数更新均与集中式全局均值一致。另检查各进程共同更新、全零优势且无 KL 共同跳过、全零优势但启用 KL 共同更新。
+- 临时目录中的日志检查通过：保留原有 13 个汇总字段及逐回答记录结构；两条真实回答加一条占位项时，均值、token 数和实际更新计数正确，占位项与概率张量不写入记录。
+- README 的 10 段 Python 摘录均按忽略空白和注释后的 token 序列与实际源码核对一致；`git diff --check` 通过。
+
+本次没有运行全量测试、GPU 检查、模型下载、GSM8K 训练或评测；不增加训练收益或真实多 GPU 已验证的结论。原有实验结果及验证边界仍按上文记录。

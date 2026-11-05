@@ -80,8 +80,10 @@ def rollout(model, tokenizer, rows, args):
     samples = []
     for row in rows:
         prompt = prompt_ids(tokenizer, row["question"])
+        # 对同一道题从当前策略采样 G 个回答，构成一个比较组。
         completions = generate(model, tokenizer, prompt, args.max_tokens, args.group_size)
         texts = [tokenizer.decode(tokens, skip_special_tokens=True) for tokens, _ in completions]
+        # 逐回答打分：正确性奖励加可选的格式奖励，得到 R_i。
         scores = [training_rewards(text, ground_truth(row["answer"]), args.format_reward_weight)
                   for text in texts]
         # R_i = 正确性_i + λ * 格式合规_i；先加奖励，再在同一道题内计算优势。
@@ -149,17 +151,72 @@ def update_policy(model, optimizer, trainable, samples, real_count, global_count
     return {"grad_norm": grad_norm.item(), **dict(zip(keys, values.tolist(), strict=True))}
 
 
+def pad_samples(samples, prompt_count, group_size, dummy_prompt, stop_id, accelerator):
+    """原地补齐各进程的 forward/backward 次数；真实回答数由调用方在补齐前保存。
+
+    尾批不重复真实回答，空槽只用于 DDP 同步，更新时权重为 0。
+    每进程的槽位数为 ceil(全局题数 / 进程数) * 每题回答数。
+    """
+    slots = ((prompt_count + accelerator.num_processes - 1) // accelerator.num_processes) * group_size
+    while len(samples) < slots:
+        samples.append({"prompt": dummy_prompt, "tokens": [stop_id],
+                        "old": torch.zeros(1), "reference": None, "advantage": 0.0})
+
+
+def should_update(samples, beta, accelerator):
+    """全局有非零优势或启用 KL 时更新；所有进程共同决定，防止同步分支不一致。"""
+    signal = torch.tensor(sum(s["advantage"] != 0 for s in samples), device=accelerator.device)
+    global_signal = accelerator.reduce(signal, reduction="sum").item()
+    # 总奖励相同时优势为 0；无 KL 则跳过，避免 Adam 历史动量继续改变参数。
+    return bool(global_signal or beta)
+
+
+def log_batch(samples, real_count, prompt_count, group_size, batch_index,
+              optimizer_steps, update_metrics, output, accelerator):
+    """所有进程收集真实回答，主进程写入原有日志字段；占位回答不参与统计。"""
+    # 日志只收集真实回答，不保存大张量，也不计入同步用的占位回答。
+    records = gather_object([{k: s[k] for k in ["index", "reward", "correct", "format_reward",
+                                               "think_format", "advantage", "response", "truncated"]}
+                             | {"tokens": len(s["tokens"])} for s in samples[:real_count]])
+    if accelerator.is_main_process:
+        groups = [records[i:i + group_size] for i in range(0, len(records), group_size)]
+        # frac_degenerate 是优势全零的题组比例；signal_tokens 统计有非零优势的
+        # 回答 token 数，便于判断奖励是否提供了区分信号，而不是衡量梯度大小。
+        log = {"batch": batch_index, "optimizer_steps": optimizer_steps, "prompts": prompt_count,
+               "reward": sum(s["reward"] for s in records) / len(records),
+               "accuracy": sum(s["correct"] for s in records) / len(records),
+               "format_reward": sum(s["format_reward"] for s in records) / len(records),
+               "think_format_rate": sum(s["think_format"] for s in records) / len(records),
+               "frac_degenerate": sum(all(s["advantage"] == 0 for s in g) for g in groups) / len(groups),
+               "mean_tokens": sum(s["tokens"] for s in records) / len(records),
+               "truncation_rate": sum(s["truncated"] for s in records) / len(records),
+               "signal_tokens": sum(s["tokens"] for s in records if s["advantage"] != 0),
+               "updates": update_metrics}
+        with (output / "train.jsonl").open("a") as f:
+            f.write(json.dumps(log, ensure_ascii=False) + "\n")
+        with (output / "rollouts.jsonl").open("a") as f:
+            f.write(json.dumps({"batch": batch_index, "samples": records}, ensure_ascii=False) + "\n")
+        print(json.dumps(log, ensure_ascii=False), flush=True)
+
+
+def save_adapter(model, tokenizer, output, accelerator):
+    """只由主进程保存 adapter 与 tokenizer；调用方负责需要时的进程同步。"""
+    if accelerator.is_main_process:
+        model.save_pretrained(output)
+        tokenizer.save_pretrained(output)
+
+
 def main(args):
     """组织数据、LoRA、采样与更新；将逐批日志、验证结果和最终 adapter 写入 output。"""
     accelerator = Accelerator(
         mixed_precision="bf16" if args.precision == "bf16" else "no",
-        gradient_accumulation_steps=1,  # 累积与归约在 update_policy 中显式完成。
-        # 累积期间不广播缓冲区；所有进程只在最后一次 backward 同步。
+        gradient_accumulation_steps=1,
         kwargs_handlers=[DistributedDataParallelKwargs(broadcast_buffers=False)],
     )
     if accelerator.gradient_accumulation_steps != 1:
         raise ValueError("Unset ACCELERATE_GRADIENT_ACCUMULATION_STEPS; this script accumulates explicitly")
-    set_seed(args.seed)  # 各进程先创建相同的 LoRA 初始参数。
+    set_seed(args.seed)
+    # 准备 GSM8K 训练题和固定验证题，验证题不参与策略更新。
     data = load_gsm8k()
     split = make_split(data["train"], args.seed, args.validation_size, args.train_limit)
     train_rows = rows_at(data["train"], split["train"])
@@ -168,19 +225,18 @@ def main(args):
         validation = validation[:args.eval_limit]
     dtype = torch.bfloat16 if args.precision == "bf16" else torch.float32
     model, tokenizer = load_model(args.model, dtype)
-    # 只训练低秩增量，基础权重不动；普通线性层插入 LoRA，lm_head 保持冻结。
+    # 初始化策略 πθ：冻结基础模型，仅通过 LoRA 学习策略增量。
     model = get_peft_model(model, LoraConfig(
         task_type="CAUSAL_LM", r=args.lora_rank, lora_alpha=args.lora_alpha,
         target_modules="all-linear", lora_dropout=0.0, bias="none",
     ))
-    # 反传时重算部分前向激活，以减少显存；不改变 GRPO 目标函数。
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     trainable = [p for p in model.parameters() if p.requires_grad]
     if any("lora_" not in name for name, p in model.named_parameters() if p.requires_grad):
         raise RuntimeError("Only LoRA parameters should be trainable")
     optimizer = torch.optim.AdamW(trainable, lr=args.learning_rate, betas=(0.9, 0.95), weight_decay=0)
     model, optimizer = accelerator.prepare(model, optimizer)
-    set_seed(args.seed, device_specific=True)  # 不同进程采样独立，初始化仍一致。
+    set_seed(args.seed, device_specific=True)
     raw_model = accelerator.unwrap_model(model)
     if accelerator.is_main_process:
         args.output.mkdir(parents=True, exist_ok=True)
@@ -201,7 +257,7 @@ def main(args):
              "python": sys.version,
              "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else None})
     accelerator.wait_for_everyone()
-    # 训练前后及定期验证共用固定题目、提示词和贪心解码，便于比较准确率。
+    # 训练前评测：记录初始策略在固定验证题上的正确率。
     before = evaluate_model(model, tokenizer, validation, accelerator, args.eval_max_tokens,
                             args.output / "validation-before.json")
     optimizer_steps = 0
@@ -210,69 +266,37 @@ def main(args):
         if args.steps and batch_index > args.steps:
             break
         batch = train_rows[start:start + global_batch_size]
-        # 按进程号交错分题，每道真实题只采样一次；尾批允许各进程题数不同。
         local_rows = batch[accelerator.process_index::accelerator.num_processes]
-        # generate 会绕过 DDP/Accelerate 的 forward 包装，显式保持与训练相同的精度。
+        # 采样：每题生成 G 个回答，计算奖励和组内优势，并固定本批 πold 的概率。
         with accelerator.autocast():
             samples = rollout(raw_model, tokenizer, local_rows, args)
         real_count = len(samples)
-        # 尾批不重复计数。空槽仅做零权重 backward，使各进程同步次数一致。
-        # ceil(本批题数 / 进程数) * G：各进程需要执行相同次数的 forward/backward。
-        slots = ((len(batch) + accelerator.num_processes - 1) // accelerator.num_processes) * args.group_size
-        dummy_prompt = prompt_ids(tokenizer, batch[0]["question"])
-        while len(samples) < slots:
-            samples.append({"prompt": dummy_prompt, "tokens": [eos_ids(tokenizer)[0]],
-                            "old": torch.zeros(1), "reference": None, "advantage": 0.0})
-        # 每组总奖励均相同且 beta=0 时，优势全为 0，跳过优化器更新。
-        # 开启格式奖励后，即使答案全错，格式差异也可能提供非零优势。
-        signal = torch.tensor(sum(s["advantage"] != 0 for s in samples), device=accelerator.device)
-        global_signal = accelerator.reduce(signal, reduction="sum").item()
+        pad_samples(samples, len(batch), args.group_size,
+                    prompt_ids(tokenizer, batch[0]["question"]), eos_ids(tokenizer)[0], accelerator)
         update_metrics = []
-        if global_signal or args.beta:
-            # 复用同一批回答和 πold，更新 πθ；下一批重新采样时才刷新 πold。
+        # 有非零优势或启用 KL 时才更新；否则本批不执行优化器步。
+        if should_update(samples, args.beta, accelerator):
+            # 策略更新：重算 πθ 的概率，用优势、概率比、clip 和可选 KL 计算 loss。
+            # 同批多次更新始终固定 πold；下一批才用更新后的策略重新采样。
             for update in range(args.updates_per_batch):
                 metrics = update_policy(model, optimizer, trainable, samples, real_count,
                                         len(batch) * args.group_size, args, accelerator)
                 optimizer_steps += 1
                 update_metrics.append({"update": update + 1, **metrics})
-        # 日志只收集真实回答，不保存大张量，也不计入同步用的占位回答。
-        records = gather_object([{k: s[k] for k in ["index", "reward", "correct", "format_reward",
-                                                   "think_format", "advantage", "response", "truncated"]}
-                                 | {"tokens": len(s["tokens"])} for s in samples[:real_count]])
-        if accelerator.is_main_process:
-            groups = [records[i:i + args.group_size] for i in range(0, len(records), args.group_size)]
-            # frac_degenerate 是优势全零的题组比例；signal_tokens 统计有非零优势的
-            # 回答 token 数，便于判断奖励是否提供了区分信号，而不是衡量梯度大小。
-            log = {"batch": batch_index, "optimizer_steps": optimizer_steps, "prompts": len(batch),
-                   "reward": sum(s["reward"] for s in records) / len(records),
-                   "accuracy": sum(s["correct"] for s in records) / len(records),
-                   "format_reward": sum(s["format_reward"] for s in records) / len(records),
-                   "think_format_rate": sum(s["think_format"] for s in records) / len(records),
-                   "frac_degenerate": sum(all(s["advantage"] == 0 for s in g) for g in groups) / len(groups),
-                   "mean_tokens": sum(s["tokens"] for s in records) / len(records),
-                   "truncation_rate": sum(s["truncated"] for s in records) / len(records),
-                   "signal_tokens": sum(s["tokens"] for s in records if s["advantage"] != 0),
-                   "updates": update_metrics}
-            with (args.output / "train.jsonl").open("a") as f:
-                f.write(json.dumps(log, ensure_ascii=False) + "\n")
-            with (args.output / "rollouts.jsonl").open("a") as f:
-                f.write(json.dumps({"batch": batch_index, "samples": records}, ensure_ascii=False) + "\n")
-            print(json.dumps(log, ensure_ascii=False), flush=True)
+        log_batch(samples, real_count, len(batch), args.group_size, batch_index,
+                  optimizer_steps, update_metrics, args.output, accelerator)
         if args.eval_every and batch_index % args.eval_every == 0:
-            # 长训练在定期验证前保存独立 LoRA 检查点，便于中途复核与单独评测。
-            if accelerator.is_main_process:
-                raw_model.save_pretrained(args.output / f"adapter-batch-{batch_index}")
-                tokenizer.save_pretrained(args.output / f"adapter-batch-{batch_index}")
+            # 定期评测：用相同验证题和贪心解码观察当前策略的表现。
+            save_adapter(raw_model, tokenizer, args.output / f"adapter-batch-{batch_index}", accelerator)
             accelerator.wait_for_everyone()
             evaluate_model(model, tokenizer, validation, accelerator, args.eval_max_tokens,
                            args.output / f"validation-batch-{batch_index}.json")
+    # 训练后评测：与初始策略比较，检查留出题目的正确率变化。
     after = evaluate_model(model, tokenizer, validation, accelerator, args.eval_max_tokens,
                            args.output / "validation-after.json")
     accelerator.wait_for_everyone()
+    save_adapter(raw_model, tokenizer, args.output / "adapter", accelerator)
     if accelerator.is_main_process:
-        # PEFT 保存 LoRA adapter；评测时仍需加载它对应的基础模型权重。
-        raw_model.save_pretrained(args.output / "adapter")
-        tokenizer.save_pretrained(args.output / "adapter")
         write_json(args.output / "summary.json", {"before": before, "after": after,
             "optimizer_steps": optimizer_steps,
             "peak_cuda_allocated_gib": torch.cuda.max_memory_allocated() / 1024**3 if torch.cuda.is_available() else None,

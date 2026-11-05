@@ -265,7 +265,7 @@ def distributed_check():
     """用 torchrun 在两个 CPU 进程运行，直接验证训练函数的尾批全局归约。"""
     from types import SimpleNamespace
     from accelerate import Accelerator, DistributedDataParallelKwargs
-    from train import update_policy
+    from train import pad_samples, should_update, update_policy
 
     accelerator = Accelerator(cpu=True, kwargs_handlers=[DistributedDataParallelKwargs(broadcast_buffers=False)])
     if accelerator.num_processes != 2:
@@ -291,10 +291,12 @@ def distributed_check():
                                     "old": old, "reference": old})
         samples = [s for i, s in enumerate(all_samples) if i // 2 % 2 == accelerator.process_index]
         real_count = len(samples)
-        slots = ((prompts + 1) // 2) * 2
-        while len(samples) < slots:
-            samples.append({"prompt": [4, 5], "tokens": [2], "old": torch.zeros(1),
-                            "reference": None, "advantage": 0.})
+        pad_samples(samples, prompts, 2, [4, 5], 2, accelerator)
+        # 包括本地无真实回答的进程，也必须与其他进程作出同一个更新决定。
+        assert should_update(samples, 0., accelerator)
+        zero_samples = [sample | {"advantage": 0.} for sample in samples]
+        assert not should_update(zero_samples, 0., accelerator)
+        assert should_update(zero_samples, args.beta, accelerator)
         # 集中式完整 loss 独立计算，包含不同回答长度和冻结的 reference。
         expected.train()
         for sample in all_samples:
