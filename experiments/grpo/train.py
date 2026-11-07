@@ -23,7 +23,7 @@ def parse_args():
     """读取训练配置；batch/step 均以“采样题目批次”为单位，区别于优化器更新。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--output", type=Path, default=Path("runs/grpo"))
+    parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parent / "runs/grpo")
     parser.add_argument("--steps", type=int, default=0, help="采样批次数上限；0 为训练集一遍")
     parser.add_argument("--train-limit", type=int, default=0, help="排除验证题后取前 N 题；0 为全部")
     # W 个进程每批最多采样 batch_size * W 道题，每题生成 group_size 条回答。
@@ -196,6 +196,8 @@ def log_batch(samples, real_count, prompt_count, group_size, batch_index,
             f.write(json.dumps(log, ensure_ascii=False) + "\n")
         with (output / "rollouts.jsonl").open("a") as f:
             f.write(json.dumps({"batch": batch_index, "samples": records}, ensure_ascii=False) + "\n")
+        accelerator.log({f"train/{k}": v for k, v in log.items() if k not in ("batch", "updates")},
+                        step=batch_index)
         print(json.dumps(log, ensure_ascii=False), flush=True)
 
 
@@ -211,6 +213,7 @@ def main(args):
     accelerator = Accelerator(
         mixed_precision="bf16" if args.precision == "bf16" else "no",
         gradient_accumulation_steps=1,
+        log_with="tensorboard", project_dir=str(args.output),
         kwargs_handlers=[DistributedDataParallelKwargs(broadcast_buffers=False)],
     )
     if accelerator.gradient_accumulation_steps != 1:
@@ -252,15 +255,21 @@ def main(args):
             "task_instruction": TASK_INSTRUCTION,
         })
         write_json(args.output / "environment.json", {
-            name: version(name) for name in ["torch", "transformers", "peft", "accelerate", "datasets"]
+            name: version(name) for name in ["torch", "transformers", "peft", "accelerate", "datasets", "tensorboard"]
         } | {"cuda": torch.version.cuda, "device": str(accelerator.device),
              "python": sys.version,
              "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else None})
     accelerator.wait_for_everyone()
+    accelerator.init_trackers("tensorboard", config={
+        k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
+    })
     # 训练前评测：记录初始策略在固定验证题上的正确率。
     before = evaluate_model(model, tokenizer, validation, accelerator, args.eval_max_tokens,
                             args.output / "validation-before.json")
+    accelerator.log({f"validation/{k}": v for k, v in before.items()}, step=0)
     optimizer_steps = 0
+    completed_batches = 0
+    last_validation_batch = 0
     global_batch_size = args.batch_size * accelerator.num_processes
     for batch_index, start in enumerate(range(0, len(train_rows), global_batch_size), 1):
         if args.steps and batch_index > args.steps:
@@ -283,17 +292,26 @@ def main(args):
                                         len(batch) * args.group_size, args, accelerator)
                 optimizer_steps += 1
                 update_metrics.append({"update": update + 1, **metrics})
+                accelerator.log({f"update/{k}": v for k, v in metrics.items()} | {
+                    "update/loss": metrics["policy_loss"] + args.beta * metrics.get("kl", 0.0),
+                    "update/learning_rate": optimizer.param_groups[0]["lr"],
+                }, step=optimizer_steps)
         log_batch(samples, real_count, len(batch), args.group_size, batch_index,
                   optimizer_steps, update_metrics, args.output, accelerator)
+        completed_batches = batch_index
         if args.eval_every and batch_index % args.eval_every == 0:
             # 定期评测：用相同验证题和贪心解码观察当前策略的表现。
             save_adapter(raw_model, tokenizer, args.output / f"adapter-batch-{batch_index}", accelerator)
             accelerator.wait_for_everyone()
-            evaluate_model(model, tokenizer, validation, accelerator, args.eval_max_tokens,
-                           args.output / f"validation-batch-{batch_index}.json")
+            metrics = evaluate_model(model, tokenizer, validation, accelerator, args.eval_max_tokens,
+                                     args.output / f"validation-batch-{batch_index}.json")
+            accelerator.log({f"validation/{k}": v for k, v in metrics.items()}, step=batch_index)
+            last_validation_batch = batch_index
     # 训练后评测：与初始策略比较，检查留出题目的正确率变化。
     after = evaluate_model(model, tokenizer, validation, accelerator, args.eval_max_tokens,
                            args.output / "validation-after.json")
+    if completed_batches != last_validation_batch:
+        accelerator.log({f"validation/{k}": v for k, v in after.items()}, step=completed_batches)
     accelerator.wait_for_everyone()
     save_adapter(raw_model, tokenizer, args.output / "adapter", accelerator)
     if accelerator.is_main_process:
@@ -303,6 +321,7 @@ def main(args):
             "peak_cuda_reserved_gib": torch.cuda.max_memory_reserved() / 1024**3 if torch.cuda.is_available() else None,
         })
     accelerator.wait_for_everyone()
+    accelerator.end_training()
 
 
 if __name__ == "__main__":

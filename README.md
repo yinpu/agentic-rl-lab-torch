@@ -9,8 +9,11 @@
 | 章节 | 任务与模型 | 内容 |
 | --- | --- | --- |
 | [GRPO](experiments/grpo/README.md) | GSM8K / Qwen2.5-0.5B Base | 显式采样、组内优势、clipped loss、LoRA、可选 KL 与格式奖励 |
+| [Jev 决策模型](experiments/jev/README.md) | Typed Decisions + ToolACE / Qwen3.5-0.8B | marker masked SFT、一次前向决策、温度校准、五项基准评测 |
 
 GRPO 使用 Transformers、PEFT 和 Accelerate，核心算法直接写在本章代码中。训练与评测共用提示词和答案判定，支持单卡运行与 `torchrun` DDP 启动。
+
+Jev 使用较小的 Qwen3.5-0.8B，通过 LoRA masked SFT 学习有限候选决策；保留参考章的原任务与数据切分，训练、推理、校准和评测均在本地运行。完整流程见 [第二节教程](experiments/jev/README.md)。
 
 ## 开始使用
 
@@ -19,12 +22,4 @@ git clone https://github.com/yinpu/agentic-rl-lab-torch.git
 cd agentic-rl-lab-torch
 ```
 
-环境准备、模型下载、算法说明、实验参数及启动命令见 [GRPO 教程](experiments/grpo/README.md)。项目使用 Python 3.12、根目录 `.venv` 与 [requirements.txt](requirements.txt)。模型、数据缓存和运行产物保存在本地，不提交到仓库。
-
-## 已执行的验证
-
-- 原版 Qwen2.5-0.5B Base：固定留出的 256 道 GSM8K 验证题答对 69 题，准确率 26.95%；这是本章提示词和判分规则下的结果。
-- 当前 loss、加 KL、加格式奖励及二者组合，均完成单卡 BF16 GPU 的少量采样、更新、保存与重载检查。
-- 已通过离线算法检查和 CPU 双进程尾批归约检查；尚未完成完整训练对照和真实多 GPU 验证。
-
-详细设置、实际结果和验证边界见 [GRPO 验证记录](experiments/grpo/validation.md)。
+各章的模型下载、算法说明、实验参数及启动命令见对应教程。项目使用 Python 3.12、根目录 `.venv` 与 [requirements.txt](requirements.txt)；首次环境准备见 [GRPO 教程](experiments/grpo/README.md)。模型、数据缓存和运行产物保存在本地，不提交到仓库。运行产物分别放在各章的 `experiments/<章节>/runs/`，每次训练在输出目录的 `tensorboard/` 下记录 TensorBoard 日志。

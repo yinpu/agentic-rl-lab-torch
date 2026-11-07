@@ -9,8 +9,6 @@
 - `task.py`：提示词、奖励、数据划分、模型加载和 GRPO 公式。
 - `train.py`：采样、缓存旧概率、逐回答反向传播、评测与保存。
 - `evaluate.py`：用同一任务定义独立评测基础模型或保存的 LoRA。
-- `test_grpo.py`：不下载权重的算法与接口检查。
-- `test_grpo_gpu.py`：使用缓存的真实模型，在单张 GPU 上检查四种配置的更新与保存重载。
 
 ## 先沿公式阅读代码
 
@@ -67,7 +65,7 @@ format_reward = format_reward_weight * float(think_format)
 
 返回记录中的 `reward` 为 `correct + format_reward`，供组内优势计算使用。
 
-`--format-reward-weight 0` 对应当前基线；设为 `0.5` 时，格式合规额外得 0.5 分，总奖励范围为 0 到 1.5。这只是对照实验的起始权重，尚未训练验证。
+`--format-reward-weight 0` 对应当前基线；设为 `0.5` 时，格式合规额外得 0.5 分，总奖励范围为 0 到 1.5。这是对照实验的起始权重，效果需要通过完整训练比较。
 
 | 输出情况 | 正确性 $c_i$ | 格式 $f_i$ | 总奖励（λ=0.5） |
 | --- | ---: | ---: | ---: |
@@ -259,6 +257,8 @@ python -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
+已有环境也需安装当前 `requirements.txt`，其中包含训练记录所需的 TensorBoard。
+
 从 ModelScope 下载本章当前选定的基础模型：
 
 ```bash
@@ -267,7 +267,7 @@ python -m venv .venv
 
 默认从这个本地路径加载。[Qwen2.5-0.5B 官方说明](https://huggingface.co/Qwen/Qwen2.5-0.5B)将它标为约 0.49B 参数、仅预训练的基础模型，不是 Instruct 或推理蒸馏版。通过 `AutoModelForCausalLM` 加载，实际模型类为 `Qwen2ForCausalLM`。`--model` 也接受本地目录或 Hugging Face 模型名，方便在服务器上指定模型位置。
 
-GSM8K 首次运行由 Datasets 自动下载到 `.cache/datasets`。缓存、`.venv` 和 `runs` 不进入版本控制。本章不需要 PyTRIO、训练 API、vLLM 或额外训练服务。
+GSM8K 首次运行由 Datasets 自动下载到 `.cache/datasets`。本章运行产物放在 `experiments/grpo/runs/`；缓存、`.venv` 和各章的 `runs/` 不进入版本控制。本章不需要 PyTRIO、训练 API、vLLM 或额外训练服务。
 
 ## 数据划分与运行
 
@@ -278,7 +278,7 @@ GSM8K 首次运行由 Datasets 自动下载到 `.cache/datasets`。缓存、`.ve
 ```bash
 .venv/bin/python experiments/grpo/evaluate.py \
   --limit 16 --max-tokens 1024 \
-  --output runs/qwen05-base/baseline.json
+  --output experiments/grpo/runs/qwen05-base/baseline.json
 ```
 
 省略 `--split-file` 时，按 seed 42 和 validation size 256 创建划分并保存为 `baseline.splits.json`；后续可用 `--split-file` 复用。训练使用相同 seed 和 validation size 时生成相同验证索引。`--limit 0` 才是全部 256 题。
@@ -287,7 +287,7 @@ GSM8K 首次运行由 Datasets 自动下载到 `.cache/datasets`。缓存、`.ve
 
 ```bash
 .venv/bin/python experiments/grpo/train.py \
-  --output runs/qwen05-smoke \
+  --output experiments/grpo/runs/qwen05-smoke \
   --steps 1 --train-limit 2 --batch-size 1 --group-size 2 \
   --max-tokens 128 --eval-limit 2 --eval-max-tokens 128
 ```
@@ -298,7 +298,7 @@ GSM8K 首次运行由 Datasets 自动下载到 `.cache/datasets`。缓存、`.ve
 
 ```bash
 .venv/bin/python experiments/grpo/train.py \
-  --output runs/qwen05-main \
+  --output experiments/grpo/runs/qwen05-main \
   --batch-size 4 --group-size 8 \
   --max-tokens 1024 --eval-limit 0
 ```
@@ -311,19 +311,19 @@ GSM8K 首次运行由 Datasets 自动下载到 `.cache/datasets`。缓存、`.ve
 
 ```bash
 .venv/bin/python experiments/grpo/evaluate.py \
-  --adapter runs/qwen05-smoke/adapter \
-  --split validation --split-file runs/qwen05-smoke/splits.json \
-  --limit 2 --max-tokens 128 --output runs/qwen05-smoke/reloaded.json
+  --adapter experiments/grpo/runs/qwen05-smoke/adapter \
+  --split validation --split-file experiments/grpo/runs/qwen05-smoke/splits.json \
+  --limit 2 --max-tokens 128 --output experiments/grpo/runs/qwen05-smoke/reloaded.json
 ```
 
 最终在测试集评测时，对基础模型和 LoRA 使用相同生成上限：
 
 ```bash
 .venv/bin/python experiments/grpo/evaluate.py \
-  --split test --limit 0 --output runs/test-base.json
+  --split test --limit 0 --output experiments/grpo/runs/test-base.json
 .venv/bin/python experiments/grpo/evaluate.py \
-  --adapter runs/qwen05-main/adapter \
-  --split test --limit 0 --output runs/test-grpo.json
+  --adapter experiments/grpo/runs/qwen05-main/adapter \
+  --split test --limit 0 --output experiments/grpo/runs/test-grpo.json
 ```
 
 ## 三类实验与组合对照
@@ -337,27 +337,27 @@ GSM8K 首次运行由 Datasets 自动下载到 `.cache/datasets`。缓存、`.ve
 | format | 0 | 0.5 | 正确性 + 格式奖励的 clipped GRPO |
 | kl-format | 0.04 | 0.5 | 格式奖励 + reference KL |
 
-以下是完整实验的待执行命令；本机只进行少量 GPU 正确性检查，不启动全量训练。四组都从原版 Qwen2.5-0.5B Base 初始化，默认使用相同 seed、数据顺序、batch/group size、学习率、LoRA 配置和生成长度，训练集一遍，验证使用全部 256 题。每组使用独立输出目录，不接着另一组的 adapter 训练。
+以下命令分别运行四组对照实验。四组都从原版 Qwen2.5-0.5B Base 初始化，默认使用相同 seed、数据顺序、batch/group size、学习率、LoRA 配置和生成长度，训练集一遍，验证使用全部 256 题。每组使用独立输出目录，不接着另一组的 adapter 训练。
 
 ```bash
 # （1）当前 loss：只有正确性奖励
 .venv/bin/python experiments/grpo/train.py \
-  --output runs/qwen05-baseline --eval-limit 0 \
+  --output experiments/grpo/runs/qwen05-baseline --eval-limit 0 \
   --beta 0 --format-reward-weight 0
 
 # （2）加 KL：与 baseline 比较 KL 的影响
 .venv/bin/python experiments/grpo/train.py \
-  --output runs/qwen05-kl --eval-limit 0 \
+  --output experiments/grpo/runs/qwen05-kl --eval-limit 0 \
   --beta 0.04 --format-reward-weight 0
 
 # （3）加格式奖励：与 baseline 比较格式奖励的影响
 .venv/bin/python experiments/grpo/train.py \
-  --output runs/qwen05-format --eval-limit 0 \
+  --output experiments/grpo/runs/qwen05-format --eval-limit 0 \
   --beta 0 --format-reward-weight 0.5
 
 # 组合对照：与 kl 比较格式奖励；与 format 比较 KL
 .venv/bin/python experiments/grpo/train.py \
-  --output runs/qwen05-kl-format --eval-limit 0 \
+  --output experiments/grpo/runs/qwen05-kl-format --eval-limit 0 \
   --beta 0.04 --format-reward-weight 0.5
 ```
 
@@ -373,7 +373,7 @@ GSM8K 首次运行由 Datasets 自动下载到 `.cache/datasets`。缓存、`.ve
 
 本实现与参考的明确差异：采用 Qwen2.5-0.5B 预训练基础模型和无示例的 think 格式指令；本地文本模型训练替代远程服务；明确选择 LoRA alpha=64、all-linear、dropout=0；只实现 clipped 策略目标；按回答等权归约；保留退化组；增加验证划分、独立贪心评测、可选 KL、可选格式奖励和梯度裁剪。参考远程服务的 LoRA 层选择、内置 loss 归约和梯度缩放未在客户端完整公开，因此不宣称数值等价。
 
-这里要区分三件事：流程能够运行、参考任务上的本地实验、原论文指标复现。前者不能替代后两者。实际验证状态见本目录 `validation.md`；未执行的配置不写成已验证。
+在本章提示词与判分规则下，原版 Qwen2.5-0.5B Base 使用 BF16、贪心解码和 1024 token 上限，在 seed=42 留出的 256 道验证题上答对 69 题，准确率为 26.95%。已有训练只完成少量更新与保存重载检查，尚无完整训练对照或训练收益结论；真实多 GPU 训练也尚未验证。
 
 ## 工程说明：多卡、精度与保存
 
@@ -381,7 +381,7 @@ GSM8K 首次运行由 Datasets 自动下载到 `.cache/datasets`。缓存、`.ve
 
 ```bash
 .venv/bin/torchrun --standalone --nproc_per_node=2 experiments/grpo/train.py \
-  --output runs/qwen05-ddp --batch-size 2 --group-size 8 --eval-limit 0
+  --output experiments/grpo/runs/qwen05-ddp --batch-size 2 --group-size 8 --eval-limit 0
 ```
 
 这是 DDP，每卡各有完整基础模型，不会把模型显存分摊到多张卡。完整采样组留在同一进程；最后不足整批时，只用真实回答数归一化。空槽做零权重计算以维持 DDP 同步，不重复计入样本或评测。梯度乘 `进程数 / 全局真实回答数`，抵消 DDP 的进程平均。
@@ -399,34 +399,14 @@ GSM8K 首次运行由 Datasets 自动下载到 `.cache/datasets`。缓存、`.ve
 
 训练产物保存在 `--output`：配置与实际任务指令、依赖版本、划分索引、训练 JSONL、实际 rollout、训练前后逐题验证结果，以及最终的 `adapter/`。每次定期验证前还会保存 `adapter-batch-N/`，可用 `evaluate.py --adapter` 单独评测；检查点仅含模型适配器与 tokenizer，不含优化器或随机数状态，不支持完整恢复训练。评测逐题写入 `*.rank-N.jsonl`，完整结束后汇总为 JSON；中止时已完成的题目仍保留，但未实现自动断点续评。使用新目录启动，避免覆盖旧实验。
 
-## 算法检查
+不传 `--output` 时，默认使用本章目录下的 `runs/grpo/`，与启动时的工作目录无关；显式传入的相对路径按当前工作目录解析。训练同时写入 `<output>/tensorboard/`，多卡仅由主进程记录全局指标。TensorBoard 的 `train/*` 与 `validation/*` 横轴是采样批次（训练前验证为 0），`update/*` 横轴是实际优化器更新次数；跳过更新的批次仍有采样指标，但没有更新指标。记录包括奖励、准确率、退化组比例、生成长度、截断率、policy loss、总 loss、ratio、clip、梯度范数、学习率，以及启用 KL 时的 KL 值。
+
+从仓库根目录启动，比较本章各次训练：
 
 ```bash
-.venv/bin/python -m pytest experiments/grpo/test_grpo.py -q
-.venv/bin/torchrun --standalone --nproc_per_node=2 experiments/grpo/test_grpo.py
+.venv/bin/tensorboard --logdir experiments/grpo/runs
 ```
 
-第一条检查答案判定、正确性/格式奖励分离、四种参数组合的 rollout 与固定 reference、优势、正负梯度方向、clip、KL、EOS、token 对齐、LoRA 基础权重冻结和适配器重新加载。第二条在两个 CPU 进程检查不足整批及空进程时，训练函数的更新是否等于集中式全局均值；这不能代替真实多 GPU 验证。随机小网络只用于这些离线检查，不替代 GSM8K 主实验。
-
-准备好模型缓存后，可在本机或服务器的一张 BF16 CUDA GPU 上运行真实模型检查：
-
-```bash
-OMP_NUM_THREADS=4 HF_HUB_OFFLINE=1 .venv/bin/python -m pytest \
-  experiments/grpo/test_grpo_gpu.py -q -s
-```
-
-四组分别从原版模型加载，使用真实 GSM8K 题目，并构造“正确/错误 × 格式合规/不合规”四种检查回答，确保格式奖励的非零分支也被覆盖。它们是明确的检查输入，不是模型自由采样结果。每组执行两次更新，检查优势、初始概率比、KL、LoRA 更新、全部基础权重的字节哈希、旧/参考概率冻结，以及保存重载后逐 token 概率和贪心生成完全一致。检查报告与适配器保存在 pytest 的临时目录；可用 `--basetemp` 指定本次检查的输出目录。缺少 CUDA 或模型缓存时会跳过这四项检查。
-
-完整训练入口也可先用一题验证采样、日志、定期保存和独立评测链路，例如：
-
-```bash
-.venv/bin/python experiments/grpo/train.py \
-  --output runs/qwen05-gpu-smoke --steps 1 --train-limit 1 \
-  --batch-size 1 --group-size 8 --max-tokens 1024 --updates-per-batch 2 \
-  --eval-limit 1 --eval-every 1 --eval-max-tokens 1024 \
-  --beta 0.04 --format-reward-weight 0.5
-```
-
-这里显式更新两次，是为了让第二次更新检查变化后的 ratio、clipping 和 KL；完整实验的默认值仍为一次。按上面的实验表替换两个系数即可检查其他三组。小规模正确性检查不用于判断训练收益；真实多 GPU 配置仍需在目标服务器验证。
+在浏览器打开 `http://localhost:6006` 查看训练曲线。
 
 进一步阅读：[DeepSeekMath 论文](https://arxiv.org/abs/2402.03300)、[PEFT LoRA](https://huggingface.co/docs/peft/package_reference/lora)、[Accelerate 梯度同步](https://huggingface.co/docs/accelerate/concept_guides/gradient_synchronization)。
