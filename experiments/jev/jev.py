@@ -1,21 +1,20 @@
-"""判别决策格式编译：canonical record → chat messages → tokens/监督位置。
+"""Jev 决策：编译决策 schema → 定位 marker → 模型前向 → 候选概率。
 
-改编自 datawhalechina/agentic-rl-lab 的 pytrio-jev/data.py（Apache-2.0）。
-本地实现去掉 PyTRIO Datum，校验候选并用字符范围定位 JSON value marker。
-
-- 候选符号表为 62 个单 token 符号（A-Z a-z 0-9），choice 按插入序、score 按等级序、
-  noul 固定 [no, yes]；
-- assistant 内容是 JSON 骨架，值的位置放占位符 marker。不加 special token（TRIO 服务端
-  词表不可扩展），用已有单 token "decision"（Qwen3.5 tokenizer id 61781）；
-- 监督只落在 marker 前一位置，其余位置不计算 loss。
+编码逻辑改编自 datawhalechina/agentic-rl-lab 的 pytrio-jev/data.py（Apache-2.0）。
+使用已有单 token marker，不扩展词表；训练仅监督 marker 前一位置。
+直接运行本文件可对 canonical JSONL 执行一次前向决策。
 """
-
 from __future__ import annotations
 
+import argparse
 import json
+import math
 import re
 from pathlib import Path
 
+import torch
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 SYSTEM_PROMPT = (
     "You are a careful decision assistant. Use the state and decision schema in "
@@ -215,3 +214,117 @@ def check_length(ids, max_length, record_id):
 def load_jsonl(path: str | Path) -> list[dict]:
     with open(path, encoding="utf-8") as f:
         return [json.loads(line) for line in f if line.strip()]
+
+
+DEFAULT_MODEL = "Qwen/Qwen3.5-0.8B"
+
+
+def model_arguments(parser: argparse.ArgumentParser):
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="模型 ID 或本地模型目录")
+    parser.add_argument("--adapter", type=Path, default=None, help="本地 LoRA adapter")
+    parser.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--max-length", type=int, default=8192, help="超长报错，不截断；0 不设上限")
+
+
+def load_model(model_name, precision="bf16", adapter=None):
+    dtype = torch.bfloat16 if precision == "bf16" else torch.float32
+    # Transformers 5 的 AutoModelForCausalLM 为 Qwen3.5 加载文本骨干，跳过视觉塔。
+    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype, attn_implementation="sdpa")
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    if adapter:
+        model = PeftModel.from_pretrained(model, adapter)
+    model.config.use_cache = False
+    return model, tokenizer
+
+
+def decision_logits(model, example, device):
+    """只对 m-1 隐状态做 lm_head，仍保留全词表 CE 的分母。"""
+    return batch_decision_logits(model, [example], device)[0]
+
+
+def batch_decision_logits(model, examples, device):
+    """批量右补齐；仅投影 marker 前一位置的并集，再取各案例实际字段。"""
+    width = max(len(e["input_ids"]) for e in examples)
+    ids = torch.zeros((len(examples), width), dtype=torch.long, device=device)
+    mask = torch.zeros_like(ids)
+    selected = torch.tensor(sorted({p for e in examples for p in e["positions"]}), device=device)
+    for i, example in enumerate(examples):
+        n = len(example["input_ids"])
+        ids[i, :n] = torch.tensor(example["input_ids"], device=device)
+        mask[i, :n] = 1
+    logits = model(input_ids=ids, attention_mask=mask, use_cache=False,
+                   logits_to_keep=selected).logits
+    field_logits = []
+    for i, example in enumerate(examples):
+        positions = torch.tensor(example["positions"], device=device)
+        columns = torch.searchsorted(selected, positions)
+        field_logits.append(logits[i, columns].float())
+    return field_logits
+
+
+@torch.inference_mode()
+def candidate_logits(model, encoder, record, device, max_length=8192):
+    encoded = encoder.encode(record, include_targets=False)
+    check_length(encoded["ids"], max_length, record.get("id"))
+    example = {
+        "input_ids": encoded["ids"][:-1],
+        "positions": [encoded["markers"][f] - 1 for f in encoded["fields"]],
+    }
+    logits = decision_logits(model, example, device)
+    return {
+        field: logits[i, [encoder.symbol_token_id(s) for s, _, _ in options]].cpu().double()
+        for i, (field, options) in enumerate(encoded["options"].items())
+    }
+
+
+def build_decisions(record, logits, temperature=1.0):
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError("temperature must be finite and positive")
+    encoded = compile_record(record, include_targets=False)
+    results = {}
+    for field, options in encoded["options"].items():
+        probabilities = torch.softmax(logits[field] / temperature, dim=0).tolist()
+        by_value = {v: p for (_, v, _), p in zip(options, probabilities, strict=True)}
+        kind = record["questions"][field]["type"]
+        result = {"type": kind, "probabilities": by_value,
+                  "prediction": max(by_value, key=by_value.get)}
+        if kind == "noul":
+            result["p_yes"] = by_value["yes"]
+            # 与参考 noul 平局规则一致。
+            result["prediction"] = "yes" if by_value["yes"] >= by_value["no"] else "no"
+        if kind == "score":
+            result["expected_score"] = sum(float(v) * p for v, p in by_value.items())
+        results[field] = result
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    model_arguments(parser)
+    parser.add_argument("--input", type=Path, required=True, help="canonical JSONL")
+    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--limit", type=int, default=3, help="0 表示全部")
+    parser.add_argument("--temperature", type=float, default=1.0)
+    args = parser.parse_args()
+    if args.limit < 0:
+        parser.error("--limit must be nonnegative")
+    model, tokenizer = load_model(args.model, args.precision, args.adapter)
+    model.to(args.device).eval()
+    encoder = Encoder(tokenizer)
+    records = load_jsonl(args.input)
+    if args.limit:
+        records = records[:args.limit]
+    outputs = []
+    for record in records:
+        logits = candidate_logits(model, encoder, record, args.device, args.max_length)
+        result = {"id": record.get("id"), "decisions": build_decisions(record, logits, args.temperature)}
+        outputs.append(result)
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in outputs))
+
+
+if __name__ == "__main__":
+    main()

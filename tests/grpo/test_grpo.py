@@ -287,8 +287,23 @@ def test_batch_update_matches_sequence_mean(micro, beta):
     fabric.launch()
     optimizer = torch.optim.SGD(model.parameters(), lr=.01)
     model, optimizer = fabric.setup(model, optimizer)
-    update_policy(model, optimizer, samples, 3, 3,
+    update_policy(model, optimizer, samples,
                   SimpleNamespace(beta=beta, clip=.2, max_grad_norm=100., micro_batch_size=micro), fabric)
     for p, q in zip(model.parameters(), reference.parameters(), strict=True):
         torch.testing.assert_close(p.grad, q.grad, atol=1e-6, rtol=1e-5)
         torch.testing.assert_close(p, q, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("count,batch_size,world_size,expected", [
+    (7, 4, 1, 4), (7, 4, 2, 4), (8, 4, 2, 8),
+])
+def test_training_size_uses_complete_batches(count, batch_size, world_size, expected):
+    from experiments.grpo.train import training_size
+    assert training_size(count, batch_size, world_size) == expected
+
+
+@pytest.mark.parametrize("count,batch_size,world_size", [(3, 4, 1), (3, 4, 2), (7, 3, 2), (0, 4, 1)])
+def test_training_size_rejects_unusable_batches(count, batch_size, world_size):
+    from experiments.grpo.train import training_size
+    with pytest.raises(ValueError):
+        training_size(count, batch_size, world_size)

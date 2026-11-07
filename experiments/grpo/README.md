@@ -239,7 +239,7 @@ currents = batch_completion_logprobs(model, chunk)
 
 ```python
 loss, metrics = grpo_loss(current, old, sample["advantage"], reference,
-                          args.beta if real else 0.0, args.clip)
+                          args.beta, args.clip)
 ```
 
 单进程时，每条真实回答的 loss 乘 $1/N$，将一个 micro-batch 的加权 loss 相加，再调用 `fabric.backward(torch.stack(weighted_losses).sum())`。所有回答反传完才统一裁剪梯度、检查有限性并执行 `optimizer.step()`。因此两个平均分别位于 `grpo_loss` 的 `.mean()` 和 `update_policy` 的回答权重中，不是每条回答更新一次参数。
@@ -305,7 +305,7 @@ GSM8K 首次运行由 Datasets 自动下载到 `.cache/datasets`。本章运行�
 
 `--micro-batch-size` 默认 1，表示每进程一次训练前向的回答数。试跑可加 `--micro-batch-size 2`；显存不足时调回 1。它不改变每题回答数或每次更新的有效 batch。一个 micro-batch 内右侧补齐，attention mask 排除 padding 的影响，只提取回答预测位置的 logprob；EOS 仍参与 loss，prompt 和 padding 不参与。
 
-`--steps 0`（默认）遍历排除验证题后的训练集一遍。`--train-limit N` 取其中前 N 题；`--steps N` 限制采样批次数，不会循环重复数据凑步数。`--batch-size` 是**每进程题数**，不是回答数；一次全局完整批次有 `进程数 × batch-size × group-size` 条回答。
+`--steps 0`（默认）遍历排除验证题后的训练集，只处理完整的全局 batch，舍弃不足一批的尾部。`--train-limit N` 取其中前 N 题；`--steps N` 限制采样批次数，不会循环重复数据凑步数。`--batch-size` 是**每进程题数**，不是回答数；一次全局完整批次有 `进程数 × batch-size × group-size` 条回答。
 
 多卡启动、梯度同步和训练产物见后面的“工程说明”。
 
@@ -386,22 +386,17 @@ GSM8K 首次运行由 Datasets 自动下载到 `.cache/datasets`。本章运行�
   --output experiments/grpo/runs/qwen05-ddp --batch-size 2 --group-size 8 --eval-limit 0
 ```
 
-这是 DDP，每卡各有完整基础模型，不会把模型显存分摊到多张卡。完整采样组留在同一进程；最后不足整批时，只用真实回答数归一化。空槽做零权重计算以维持 DDP 同步，不重复计入样本或评测。梯度乘 `进程数 / 全局真实回答数`，抵消 DDP 的进程平均。
+这是 DDP，每卡各有完整基础模型，不会把模型显存分摊到多张卡。完整采样组留在同一进程。单卡和多卡都只处理完整的全局 batch，舍弃不足一批的尾部；数据不足一批时报错，需调小 `--batch-size` 或增加数据。评测仍使用所选的全部题目。
 
-`train.py` 将这些协调工作留在本章内部的小函数里：
+`should_update` 汇总各进程的优势信号，让所有进程共同更新或共同跳过；有 KL 时仍更新。`log_batch` 收集回答并汇总日志，`save_adapter` 仅由主进程保存权重和 tokenizer。
 
-- `pad_samples`：尾批补齐同步槽位，真实回答数在调用前保存。
-- `should_update`：归约各进程的优势信号，让所有进程共同更新或共同跳过；有 KL 时仍更新。
-- `log_batch`：只收集真实回答，汇总并写入日志；占位项不进入指标。
-- `save_adapter`：仅主进程保存适配器与 tokenizer，调用方安排同步。
-
-`update_policy` 中，前面的 micro-batch 使用 `fabric.no_backward_sync` 在本地累积，最后一个 micro-batch 反传才同步。若全局有 $N$ 条真实回答、$W$ 个进程，每条真实回答的权重为 $W/N$，占位项为 0；DDP 再对进程梯度求平均，得到 $\frac{1}{N}\sum_i\nabla L_i$。单进程时自然退化为 $1/N$。这是回答平均在多进程下的实现，不改变前面定义的目标。
+`update_policy` 中，前面的 micro-batch 使用 `fabric.no_backward_sync` 在本地累积，最后一个 micro-batch 反传才同步。各卡回答数相同，因此每条回答的 loss 除以本卡回答数，DDP 再对各卡梯度求平均，即得到全局回答均值。
 
 模型加载时关闭 dropout，LoRA dropout 也为 0。BF16/FP32 由参数选择，Fabric 负责训练前向的精度；绕过包装器的采样与评测显式使用同样的 autocast。梯度检查点通过反传时重算激活减少显存占用。`--micro-batch-size` 控制同时保留多少条回答的计算图；增加它可能提高吞吐量，也会增加显存和 padding 开销。
 
-训练产物保存在 `--output`：配置与实际任务指令、依赖版本、划分索引、训练 JSONL、实际 rollout、训练前后逐题验证结果，以及最终的 `adapter/`。每次定期验证前还会保存 `adapter-batch-N/`，可用 `evaluate.py --adapter` 单独评测；检查点仅含模型适配器与 tokenizer，不含优化器或随机数状态，不支持完整恢复训练。评测逐题写入 `*.rank-N.jsonl`，完整结束后汇总为 JSON；中止时已完成的题目仍保留，但未实现自动断点续评。使用新目录启动，避免覆盖旧实验。
+训练产物保存在 `--output`：TensorBoard 超参数配置、划分索引、训练 JSONL、实际 rollout、训练前后逐题验证结果，以及最终的 `adapter/`。每次定期验证前还会保存 `adapter-batch-N/`，可用 `evaluate.py --adapter` 单独评测；检查点仅含模型适配器与 tokenizer，不含优化器或随机数状态，不支持完整恢复训练。评测逐题写入 `*.rank-N.jsonl`，完整结束后汇总为 JSON；中止时已完成的题目仍保留，但未实现自动断点续评。使用新目录启动，避免覆盖旧实验。
 
-不传 `--output` 时，默认使用本章目录下的 `runs/grpo/`，与启动时的工作目录无关；显式传入的相对路径按当前工作目录解析。训练同时写入 `<output>/tensorboard/`，多卡仅由主进程记录全局指标。TensorBoard 的 `train/*` 与 `validation/*` 横轴是采样批次（训练前验证为 0），`update/*` 横轴是实际优化器更新次数；跳过更新的批次仍有采样指标，但没有更新指标。记录包括奖励、准确率、退化组比例、生成长度、截断率、policy loss、总 loss、ratio、clip、梯度范数、学习率，以及启用 KL 时的 KL 值。
+不传 `--output` 时，默认使用本章目录下的 `runs/grpo/`，与启动时的工作目录无关；显式传入的相对路径按当前工作目录解析。训练使用 Fabric 的 `TensorBoardLogger`，参数和曲线保存在 `<output>/tensorboard/` 的事件文件中，可在 TensorBoard 的 HParams 页面查看参数，多卡仅由主进程记录全局指标。TensorBoard 的 `train/*` 与 `validation/*` 横轴是采样批次（训练前验证为 0），`update/*` 横轴是实际优化器更新次数；跳过更新的批次仍有采样指标，但没有更新指标。记录包括奖励、准确率、退化组比例、生成长度、截断率、policy loss、总 loss、ratio、clip、梯度范数、学习率，以及启用 KL 时的 KL 值。
 
 从仓库根目录启动，比较本章各次训练：
 
@@ -415,18 +410,9 @@ GSM8K 首次运行由 Datasets 自动下载到 `.cache/datasets`。本章运行�
 
 ## 验证与试跑（2026-11-07）
 
-算法检查使用小随机模型验证 token 对齐、padding 排除及正确的全局归约，不作为任务效果。两进程 CPU DDP 覆盖了尾批和没有真实样本的 rank；真实多 GPU 训练仍未验证。
+算法检查使用小随机模型验证 token 对齐、padding 排除及正确的全局归约，不作为任务效果。两进程 CPU DDP 验证了完整批次下的全局回答均值与共同更新决策；真实多 GPU 训练仍未验证。
 
-真实 Qwen2.5-0.5B 已执行一题、每题两条回答的短生成试跑（32 token 上限），完成训练前后验证、日志和 adapter 保存。该批回答全错且优势为零，KL 初值也为零，因此本次自由采样只验证流程；非零 LoRA 更新、KL/格式奖励分支及保存重载由 CUDA 检查中的受控 GSM8K 回答验证。该题两条回答的训练生成耗时约 0.525 秒，不含验证和更新。
-
-短样本计时使用本机 RTX 4070 Ti SUPER 16GB、BF16、LoRA rank=32、梯度检查点和相同的四条样本；预热一次后，对三次更新计时并同步 CUDA。只测更新阶段，排除模型加载、生成、验证和保存。
-
-| micro-batch | 秒/更新 | 样本/秒 | 峰值已分配显存 GiB |
-| --- | --- | --- | --- |
-| 1 | 0.326 | 12.25 | 1.33 |
-| 2 | 0.164 | 24.44 | 1.41 |
-
-样本构造、长度和原始数值见 [fabric-validation.json](fabric-validation.json)。GRPO 使用前两道 GSM8K 训练题的参考解答及固定错误回答，不是自由采样轨迹。这些短测量只说明批处理在本次输入上的收益，不代表完整训练加速比；不同长度、padding 比例和硬件可能产生不同结果。
+真实 Qwen2.5-0.5B 已执行一题、每题两条回答的短生成试跑（32 token 上限），完成训练前后验证、日志和 adapter 保存。该批回答全错且优势为零，KL 初值也为零，因此本次自由采样只验证流程；非零 LoRA 更新、KL/格式奖励分支及保存重载由 CUDA 检查中的受控 GSM8K 回答验证。
 
 验证命令：
 

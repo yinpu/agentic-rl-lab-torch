@@ -8,11 +8,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from experiments.jev.calibrate import fit_temperature, mean_nll
-from experiments.jev.data import ANSWER_SYMBOLS, Encoder, compile_record, normalize_label
-from experiments.jev.evaluate import adapt_jevbench, metrics
-from experiments.jev.inference import build_decisions
-from experiments.jev.modeling import decision_logits
+from experiments.jev.evaluate import adapt_jevbench, fit_temperature, mean_nll, metrics
+from experiments.jev.jev import (ANSWER_SYMBOLS, Encoder, build_decisions, compile_record,
+                                 decision_logits, normalize_label)
 from experiments.jev.prepare_data import convert_toolace, convert_typed_decisions
 
 
@@ -148,7 +146,7 @@ def test_calibration_identity_is_checked_before_loading(tmp_path, monkeypatch):
     calibration = tmp_path / "calibration.json"
     calibration.write_text(json.dumps({"identity": {"model": "different", "adapter_sha256": None},
                                        "temperature": 1.0}))
-    monkeypatch.setattr(sys, "argv", ["evaluate.py", "--model", "unused-model", "--calibration",
+    monkeypatch.setattr(sys, "argv", ["evaluate.py", "eval", "--model", "unused-model", "--calibration",
                                     str(calibration), "--output", str(tmp_path / "eval.json")])
     with pytest.raises(ValueError, match="different model/adapter"):
         evaluate.main()
@@ -159,7 +157,7 @@ def test_batch_update_matches_field_mean(micro):
     from copy import deepcopy
     from lightning.fabric import Fabric
     from transformers import Qwen2Config, Qwen2ForCausalLM
-    from experiments.jev.modeling import batch_decision_logits
+    from experiments.jev.jev import batch_decision_logits
     from experiments.jev.train import update
     torch.manual_seed(8)
     model = Qwen2ForCausalLM(Qwen2Config(vocab_size=80, hidden_size=16, intermediate_size=24,
@@ -183,3 +181,18 @@ def test_batch_update_matches_field_mean(micro):
     for p, q in zip(model.parameters(), reference.parameters(), strict=True):
         torch.testing.assert_close(p.grad, q.grad, atol=1e-6, rtol=1e-5)
         torch.testing.assert_close(p, q, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("count,batch_size,world_size,expected", [
+    (7, 4, 1, 4), (7, 4, 2, 4), (8, 4, 2, 8),
+])
+def test_training_size_uses_complete_batches(count, batch_size, world_size, expected):
+    from experiments.jev.train import training_size
+    assert training_size(count, batch_size, world_size) == expected
+
+
+@pytest.mark.parametrize("count,batch_size,world_size", [(3, 4, 1), (3, 4, 2), (7, 3, 2), (0, 4, 1)])
+def test_training_size_rejects_unusable_batches(count, batch_size, world_size):
+    from experiments.jev.train import training_size
+    with pytest.raises(ValueError):
+        training_size(count, batch_size, world_size)

@@ -97,7 +97,7 @@ def test_qwen_gpu_reward_update_and_reload(beta, weight, monkeypatch, tmp_path):
         initial_reference = completion_logprobs(raw_model, samples[0]["prompt"], samples[0]["tokens"])
 
     # 固定同一批 old，更新两次：首步检查初始 ratio/KL，第二步实际检验策略变化。
-    updates = [train.update_policy(model, optimizer, samples, len(samples), len(samples),
+    updates = [train.update_policy(model, optimizer, samples,
                                     args, fabric) for _ in range(2)]
     assert all(torch.isfinite(torch.tensor(list(metrics.values()))).all() for metrics in updates)
     assert all(metrics["grad_norm"] > 0 for metrics in updates)

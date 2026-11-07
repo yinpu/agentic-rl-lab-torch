@@ -6,6 +6,15 @@
 
 默认使用较小的 [Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B)，参考章使用 Qwen3.5-4B。数据任务、切分、提示词和决策机制对齐参考章，结果不能直接称为参考章 4B 实验复现。
 
+本章代码按四个职责组织：
+
+| 文件 | 内容 |
+| --- | --- |
+| [`jev.py`](jev.py) | schema 编译、marker 编码、模型前向、候选概率；也可直接运行推理 |
+| [`prepare_data.py`](prepare_data.py) | 数据下载、转换和划分 |
+| [`train.py`](train.py) | LoRA masked SFT 与 Fabric 训练循环 |
+| [`evaluate.py`](evaluate.py) | `calibrate` 温度拟合与 `eval` 评测 |
+
 ## 1. 模型怎样做决策
 
 一条数据采用 canonical JSON，`questions` 中每个字段包含 `type`、`instructions` 和可选的 `criteria`；训练时另有 `targets`，推理不需要标签。
@@ -26,7 +35,7 @@
 }
 ```
 
-[`data.py`](data.py) 的 `compile_record` 将选项依次映射到 `A-Z a-z 0-9`，最多 62 个选项。`choice` 保持 criteria 插入顺序；`score` 的列表按下标 0、1、2…，字典保持给定顺序；`noul` 固定 `no → A, yes → B`。`score` 的字典键须能转换为数值，以便计算期望分。
+[`jev.py`](jev.py) 的 `compile_record` 将选项依次映射到 `A-Z a-z 0-9`，最多 62 个选项。`choice` 保持 criteria 插入顺序；`score` 的列表按下标 0、1、2…，字典保持给定顺序；`noul` 固定 `no → A, yes → B`。`score` 的字典键须能转换为数值，以便计算期望分。
 
 system 提示词要求用符号作答，user 提示词包含 state 和决策 schema，assistant 内容却始终是如下骨架：
 
@@ -50,11 +59,11 @@ L=\frac{1}{\sum_i |F_i|}\sum_i\sum_{f\in F_i}\ell_{i,f}.
 
 分母是**完整词表**。训练输入保留 marker，不将其替换成正确答案，所以后面的字段看不到前面字段的金标准答案。普通语言建模的“答案填入输入，再 mask labels”会改变这里的条件信息。
 
-[`modeling.py`](modeling.py) 的 `decision_logits` 用 `logits_to_keep` 仅在这些位置计算 lm_head，降低长序列的 logits 显存占用；[`train.py`](train.py) 的 `update` 对所选位置执行全词表交叉熵。训练用 `batch_decision_logits` 将多个案例右侧补齐、共同前向，使用 attention mask，并只投影本批 marker 预测位置的并集。随后取各案例的实际字段，以全局字段总数归一。它没有把每条记录的平均 loss 再平均，否则 ToolACE 的单字段记录与 Typed Decisions 的五字段记录会被错误加权。
+[`jev.py`](jev.py) 的 `decision_logits` 用 `logits_to_keep` 仅在这些位置计算 lm_head，降低长序列的 logits 显存占用；[`train.py`](train.py) 的 `update` 对所选位置执行全词表交叉熵。训练用 `batch_decision_logits` 将多个案例右侧补齐、共同前向，使用 attention mask，并只投影本批 marker 预测位置的并集。随后取各案例的实际字段，以全局字段总数归一。它没有把每条记录的平均 loss 再平均，否则 ToolACE 的单字段记录与 Typed Decisions 的五字段记录会被错误加权。
 
 ### 推理：只在候选之间归一化
 
-[`inference.py`](inference.py) 使用同一个骨架，在一次前向中提取所有字段的候选 logits。对于字段候选集合 C_f：
+[`jev.py`](jev.py) 使用同一个骨架，在一次前向中提取所有字段的候选 logits。对于字段候选集合 C_f：
 
 \[
 p_f(c;T)=\frac{\exp(z_{m_f-1,c}/T)}{\sum_{c'\in C_f}\exp(z_{m_f-1,c'}/T)}.
@@ -113,7 +122,7 @@ python experiments/jev/train.py --model "$JEV_MODEL" \
   --max-samples 16 --batch-size 4 --micro-batch-size 2 --epochs 1 --max-steps 2 \
   --save-every 0 --output experiments/jev/runs/jev-smoke
 
-python experiments/jev/inference.py --model "$JEV_MODEL" \
+python experiments/jev/jev.py --model "$JEV_MODEL" \
   --adapter experiments/jev/runs/jev-smoke/final \
   --input experiments/jev/datasets/dev.jsonl --limit 2
 ```
@@ -150,11 +159,11 @@ torchrun --standalone --nproc_per_node=2 experiments/jev/train.py \
 
 训练循环使用 Fabric 的 `setup`、`backward`、`clip_gradients` 和日志接口；只有最后一个 micro-batch 同步梯度。显存不足时调小 micro-batch，不自动改变全局 batch。
 
-DDP 会平均各卡梯度，所以 `update` 对本卡每个字段的 CE 乘 `world_size / 全局字段数`。尾批保留，卡间案例数不等时用零权重占位，让各卡执行相同次数的 backward，避免重复样本进入目标函数。相对于参考脚本丢弃不足一批的尾部，这是显式差异；默认 2160/16 整除时没有影响。
+DDP 会平均各卡梯度，所以 `update` 对本卡每个字段的 CE 乘 `world_size / 全局字段数`。单卡和多卡都只处理完整的全局 batch，舍弃不足一批的尾部。多卡要求 `--batch-size` 能被进程数整除，各卡案例数相同，但字段数可以不同。数据不足一批时报错，需调小 batch 或增加数据；默认 2160/16 整除。评测和温度校准仍使用所选的全部案例。
 
-产物包括训练配置与选中案例 ID、数据文件指纹、逐步 `train.jsonl` 日志、`tensorboard/` 事件日志、`step-*`/`epoch-*`/`final` LoRA 权重和 tokenizer。checkpoint 是供推理/评测使用的 adapter，没有保存优化器状态，不支持精确断点续训。
+产物包括逐步 `train.jsonl` 日志、保存训练参数和曲线的 `tensorboard/` 事件日志、`step-*`/`epoch-*`/`final` LoRA 权重和 tokenizer。checkpoint 是供推理/评测使用的 adapter，没有保存优化器状态，不支持精确断点续训。
 
-运行产物放在本章的 `experiments/jev/runs/`；不传 `--output` 时默认使用本章目录下的 `runs/jev/`，与启动时的工作目录无关。显式传入的相对路径按当前工作目录解析。TensorBoard 以实际优化器更新步数为横轴，记录全局字段平均 loss、裁剪前梯度范数、监督字段数、案例数、epoch 和学习率；多卡仅主进程写入。从仓库根目录启动：
+运行产物放在本章的 `experiments/jev/runs/`；不传 `--output` 时默认使用本章目录下的 `runs/jev/`，与启动时的工作目录无关。显式传入的相对路径按当前工作目录解析。Fabric 的 `TensorBoardLogger` 保存训练参数和曲线，TensorBoard 以实际优化器更新步数为横轴，记录全局字段平均 loss、裁剪前梯度范数、监督字段数、案例数、epoch 和学习率；多卡仅主进程写入。从仓库根目录启动：
 
 ```bash
 .venv/bin/tensorboard --logdir experiments/jev/runs
@@ -170,24 +179,24 @@ DDP 会平均各卡梯度，所以 `update` 对本卡每个字段的 CE 乘 `wor
 
 ```bash
 # 基础模型与训练后都可评 dev；不传 --adapter 即基础模型。
-python experiments/jev/evaluate.py --model "$JEV_MODEL" --suite dev \
+python experiments/jev/evaluate.py eval --model "$JEV_MODEL" --suite dev \
   --output experiments/jev/runs/jev-full/dev-base.json
-python experiments/jev/evaluate.py --model "$JEV_MODEL" \
+python experiments/jev/evaluate.py eval --model "$JEV_MODEL" \
   --adapter experiments/jev/runs/jev-full/final --suite dev --output experiments/jev/runs/jev-full/dev-final.json
 
 # 只在 calibration 划分拟合所选 checkpoint 的 T。
-python experiments/jev/calibrate.py --model "$JEV_MODEL" \
+python experiments/jev/evaluate.py calibrate --model "$JEV_MODEL" \
   --adapter experiments/jev/runs/jev-full/final --output experiments/jev/runs/jev-full/calibration.json
 
 # 固定模型和温度后跑五项测试；同时保留校准前结果。
-python experiments/jev/evaluate.py --model "$JEV_MODEL" \
+python experiments/jev/evaluate.py eval --model "$JEV_MODEL" \
   --adapter experiments/jev/runs/jev-full/final --suite all --output experiments/jev/runs/jev-full/test-raw.json
-python experiments/jev/evaluate.py --model "$JEV_MODEL" \
+python experiments/jev/evaluate.py eval --model "$JEV_MODEL" \
   --adapter experiments/jev/runs/jev-full/final --suite all --calibration experiments/jev/runs/jev-full/calibration.json \
   --output experiments/jev/runs/jev-full/test-calibrated.json
 ```
 
-[`calibrate.py`](calibrate.py) 最小化字段平均 NLL。令逆温度 β=1/T，NLL 对 β 凸，导数是 `E_p[z] − z_gold`；在 β∈[0.01,100] 二分找零点，最优点超出范围时取边界。T>0 不改变 argmax，只改变置信度。校准文件保存原始候选 logits、标签下标、NLL、模型位置与 adapter 权重指纹，评测会拒绝模型或 adapter 不匹配的温度文件。
+[`evaluate.py`](evaluate.py) 的 `fit_temperature` 最小化字段平均 NLL。令逆温度 β=1/T，NLL 对 β 凸，导数是 `E_p[z] − z_gold`；在 β∈[0.01,100] 二分找零点，最优点超出范围时取边界。T>0 不改变 argmax，只改变置信度。校准文件保存原始候选 logits、标签下标、NLL、模型位置与 adapter 权重指纹，评测会拒绝模型或 adapter 不匹配的温度文件。
 
 [`evaluate.py`](evaluate.py) 保存逐字段预测和以下汇总：
 
@@ -199,22 +208,13 @@ python experiments/jev/evaluate.py --model "$JEV_MODEL" \
 
 校准和评测的 `--limit` 仅供检查流程；限量输出不可充当全量基准。完整训练前后的基础模型对照、不同随机种子和 Hard 分布泛化，需要实际实验后再下结论。本章已完成 0.8B 的少量单卡更新、重载、限量校准与评测，尚未完成全量训练与基准对照，真实多 GPU 训练尚未验证。
 
-`data.py`、`prepare_data.py` 和固定模板改编或复制自上述 Datawhale 参考 commit，许可证保留在 [LICENSE.upstream](LICENSE.upstream)。数据各自遵循原数据源的许可证。模型 API 依据 [Transformers Qwen3.5 文档](https://huggingface.co/docs/transformers/en/model_doc/qwen3_5)，实际依赖版本以根目录锁定文件为准。
+`jev.py` 中的编码逻辑、`prepare_data.py` 和固定模板改编或复制自上述 Datawhale 参考 commit，许可证保留在 [LICENSE.upstream](LICENSE.upstream)。数据各自遵循原数据源的许可证。模型 API 依据 [Transformers Qwen3.5 文档](https://huggingface.co/docs/transformers/en/model_doc/qwen3_5)，实际依赖版本以根目录锁定文件为准。
 
 ## 验证与试跑（2026-11-07）
 
-算法检查使用小随机模型验证 token 对齐、padding 排除及正确的全局归约，不作为任务效果。两进程 CPU DDP 覆盖了尾批和没有真实样本的 rank；真实多 GPU 训练仍未验证。
+算法检查使用小随机模型验证 token 对齐、padding 排除及正确的全局归约，不作为任务效果。两进程 CPU DDP 验证了完整批次中不同字段数的全局归约；真实多 GPU 训练仍未验证。
 
 真实 Qwen3.5-0.8B 已在原任务两条记录上，以 micro-batch=2 完成一次更新和 adapter 保存，并重载执行两条 dev 案例推理。没有全量训练或基准效果结论。
-
-短样本计时使用本机 RTX 4070 Ti SUPER 16GB、BF16、LoRA rank=32、梯度检查点和相同的四条样本；预热一次后，对三次更新计时并同步 CUDA。只测更新阶段，排除模型加载、生成、验证和保存。
-
-| micro-batch | 秒/更新 | 样本/秒 | 峰值已分配显存 GiB |
-| --- | --- | --- | --- |
-| 1 | 0.470 | 8.51 | 3.93 |
-| 2 | 0.347 | 11.51 | 6.10 |
-
-样本构造、长度和原始数值见 [fabric-validation.json](fabric-validation.json)。Jev 使用训练文件前 16 条案例中最短的四条，字段数均为 1；线性注意力使用未安装可选加速内核时的 PyTorch 实现。这些短测量只说明批处理在本次输入上的收益，不代表完整训练加速比；不同长度、padding 比例和硬件可能产生不同结果。
 
 验证命令：
 

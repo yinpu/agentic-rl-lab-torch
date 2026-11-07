@@ -1,6 +1,6 @@
 """torchrun --standalone --nproc_per_node=2 tests/jev/check_ddp.py
 
-用小随机模型检查字段数不等、不能整除的 batch、空 rank 占位的归约；不报告任务效果。
+用小随机模型检查完整批次中字段数不等的全局归约；不报告任务效果。
 """
 from copy import deepcopy
 from pathlib import Path
@@ -32,10 +32,10 @@ def main():
     model, optimizer = fabric.setup(model, optimizer)
     many = {"input_ids": [1, 2, 3, 4, 5], "positions": [1, 3], "targets": [61, 62]}
     one = {"input_ids": [6, 7, 8, 9], "positions": [2], "targets": [63]}
-    for batch in [[many, one, many], [one], [many, one]]:
+    for batch in [[many, one, many, one, many, one], [many, one], [one, many, many, one]]:
         actual = update(model, optimizer, batch, fabric, micro_batch_size=2)
         ref_optimizer.zero_grad()
-        from experiments.jev.modeling import decision_logits
+        from experiments.jev.jev import decision_logits
         import torch.nn.functional as F
         loss = sum(F.cross_entropy(decision_logits(reference, e, "cpu"), torch.tensor(e["targets"]), reduction="sum") for e in batch) / sum(len(e["targets"]) for e in batch)
         loss.backward()
@@ -44,7 +44,7 @@ def main():
         assert abs(actual["loss"] - expected["loss"]) < 1e-6
         for p, q in zip(model.module.parameters(), reference.parameters(), strict=True):
             assert torch.allclose(p, q, atol=1e-6), (p - q).abs().max().item()
-    fabric.print("PASS: DDP matches single-process field-mean updates for uneven and singleton batches")
+    fabric.print("PASS: DDP matches single-process field-mean updates for complete batches with unequal field counts")
     for logger in fabric.loggers:
         logger.finalize("success")
 

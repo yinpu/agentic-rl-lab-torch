@@ -2,7 +2,6 @@
 
 import argparse
 import os
-from importlib.metadata import version
 import json
 from pathlib import Path
 import sys
@@ -19,7 +18,7 @@ if __package__ in (None, ""):
 
 from .evaluate import evaluate_model, gather_records
 from .task import (DEFAULT_MODEL, TASK_INSTRUCTION, batch_completion_logprobs, completion_logprobs,
-                  eos_ids, generate, ground_truth,
+                  generate, ground_truth,
                   group_advantages, grpo_loss, load_gsm8k, load_model, make_split,
                   prompt_ids, rows_at, training_rewards, write_json)
 
@@ -113,12 +112,21 @@ def rollout(model, tokenizer, rows, args):
     return samples
 
 
-def update_policy(model, optimizer, samples, real_count, global_count, args, fabric):
+def training_size(count, batch_size, world_size):
+    """只处理完整全局 batch；多卡时每卡分到相同数量的样本。"""
+    if world_size > 1 and batch_size % world_size:
+        raise ValueError("global batch size must be divisible by world size")
+    size = count // batch_size * batch_size
+    if size == 0:
+        raise ValueError("not enough training data for one batch; reduce batch size or add data")
+    return size
+
+
+def update_policy(model, optimizer, samples, args, fabric):
     """逐 micro-batch 累积梯度，执行一次 optimizer.step()，返回全局平均的日志指标。
 
     model 是 Fabric 包装后的策略；optimizer 只更新 LoRA 参数。
-    samples 是 rollout 记录，尾部可有用于同步的占位回答；real_count 是本进程
-    真实回答数，global_count 是所有进程的真实回答总数，均不含占位项。
+    samples 是本进程的 rollout 记录，多卡时各进程回答数相同。
     args 使用 beta、clip、max_grad_norm、micro_batch_size；fabric 负责反传、同步和归约。
     对每条回答先平均 token loss，再平均全局回答；一次只保留一个 micro-batch 的计算图。
     """
@@ -132,59 +140,39 @@ def update_policy(model, optimizer, samples, real_count, global_count, args, fab
         with fabric.no_backward_sync(model, enabled=start + micro < len(samples)):
             currents = batch_completion_logprobs(model, chunk)
             weighted_losses = []
-            for i, (sample, current) in enumerate(zip(chunk, currents, strict=True), start):
-                real = i < real_count
+            for sample, current in zip(chunk, currents, strict=True):
                 old = sample["old"].to(fabric.device)
                 reference = sample["reference"]
                 if reference is not None:
                     reference = reference.to(fabric.device)
                 loss, metrics = grpo_loss(current, old, sample["advantage"], reference,
-                                          args.beta if real else 0.0, args.clip)
-                # DDP 平均 W 份梯度：每条回答乘 W/N，保持全局回答等权。
-                weighted_losses.append(loss * (fabric.world_size / global_count if real else 0.0))
-                if real:
-                    for key, value in metrics.items():
-                        metrics_sum[key] = metrics_sum.get(key, 0.0) + value
+                                          args.beta, args.clip)
+                # 各卡回答数相同：本卡回答均值再经 DDP 平均，即全局回答均值。
+                weighted_losses.append(loss / len(samples))
+                for key, value in metrics.items():
+                    metrics_sum[key] = metrics_sum.get(key, 0.0) + value
             fabric.backward(torch.stack(weighted_losses).sum())
     # 整批梯度累积完后统一裁剪；返回的 grad_norm 是裁剪前的总范数。
     grad_norm = fabric.clip_gradients(model, optimizer, max_norm=args.max_grad_norm)
-    if not torch.isfinite(grad_norm):
-        raise RuntimeError("Non-finite gradient; stop without saving updated weights")
     optimizer.step()
-    # 空槽也使用相同的 key，保证所有进程参与相同的 collective。
-    keys = ["policy_loss", "ratio_mean", "clip_fraction"] + (["kl"] if args.beta else [])
-    values = torch.tensor([metrics_sum.get(k, 0.0) for k in keys], device=fabric.device)
-    values = fabric.all_reduce(values, reduce_op="sum") / global_count
-    return {"grad_norm": grad_norm.item(), **dict(zip(keys, values.tolist(), strict=True))}
-
-
-def pad_samples(samples, prompt_count, group_size, dummy_prompt, stop_id, fabric):
-    """原地补齐各进程的 forward/backward 次数；真实回答数由调用方在补齐前保存。
-
-    尾批不重复真实回答，空槽只用于 DDP 同步，更新时权重为 0。
-    每进程的槽位数为 ceil(全局题数 / 进程数) * 每题回答数。
-    """
-    slots = ((prompt_count + fabric.world_size - 1) // fabric.world_size) * group_size
-    while len(samples) < slots:
-        samples.append({"prompt": dummy_prompt, "tokens": [stop_id],
-                        "old": torch.zeros(1), "reference": None, "advantage": 0.0})
+    # Fabric 直接归约指标字典：各卡回答数相同，平均本卡均值即可。
+    metrics = fabric.all_reduce({key: value / len(samples) for key, value in metrics_sum.items()})
+    return {"grad_norm": grad_norm.item(), **{key: value.item() for key, value in metrics.items()}}
 
 
 def should_update(samples, beta, fabric):
     """全局有非零优势或启用 KL 时更新；所有进程共同决定，防止同步分支不一致。"""
-    signal = torch.tensor(sum(s["advantage"] != 0 for s in samples), device=fabric.device)
-    global_signal = fabric.all_reduce(signal, reduce_op="sum").item()
+    global_signal = fabric.all_reduce(sum(s["advantage"] != 0 for s in samples), reduce_op="sum").item()
     # 总奖励相同时优势为 0；无 KL 则跳过，避免 Adam 历史动量继续改变参数。
     return bool(global_signal or beta)
 
 
-def log_batch(samples, real_count, prompt_count, group_size, batch_index,
+def log_batch(samples, prompt_count, group_size, batch_index,
               optimizer_steps, update_metrics, output, fabric):
-    """所有进程收集真实回答，主进程写入原有日志字段；占位回答不参与统计。"""
-    # 日志只收集真实回答，不保存大张量，也不计入同步用的占位回答。
+    """收集各进程的回答与指标，由主进程写入日志。"""
     records = gather_records([{k: s[k] for k in ["index", "reward", "correct", "format_reward",
                                                "think_format", "advantage", "response", "truncated"]}
-                             | {"tokens": len(s["tokens"])} for s in samples[:real_count]])
+                             | {"tokens": len(s["tokens"])} for s in samples])
     if fabric.is_global_zero:
         groups = [records[i:i + group_size] for i in range(0, len(records), group_size)]
         # frac_degenerate 是优势全零的题组比例；signal_tokens 统计有非零优势的
@@ -231,6 +219,8 @@ def main(args):
     data = load_gsm8k()
     split = make_split(data["train"], args.seed, args.validation_size, args.train_limit)
     train_rows = rows_at(data["train"], split["train"])
+    global_batch_size = args.batch_size * fabric.world_size
+    train_size = training_size(len(train_rows), global_batch_size, fabric.world_size)
     validation = rows_at(data["train"], split["validation"])
     if args.eval_limit:
         validation = validation[:args.eval_limit]
@@ -243,8 +233,6 @@ def main(args):
     ))
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     trainable = [p for p in model.parameters() if p.requires_grad]
-    if any("lora_" not in name for name, p in model.named_parameters() if p.requires_grad):
-        raise RuntimeError("Only LoRA parameters should be trainable")
     optimizer = torch.optim.AdamW(trainable, lr=args.learning_rate, betas=(0.9, 0.95), weight_decay=0)
     model, optimizer = fabric.setup(model, optimizer)
     fabric.seed_everything(args.seed + fabric.global_rank)
@@ -252,21 +240,9 @@ def main(args):
     if fabric.is_global_zero:
         args.output.mkdir(parents=True, exist_ok=True)
         write_json(args.output / "splits.json", split)
-        model_source = Path(args.model) / "source.json"
-        if model_source.is_file():
-            write_json(args.output / "model-source.json", json.loads(model_source.read_text()))
-        write_json(args.output / "config.json", vars(args) | {
-            "output": str(args.output), "world_size": fabric.world_size,
-            "global_prompts_per_batch": args.batch_size * fabric.world_size,
-            "reference_source_commit": "8493321013c02eef6cf79ca2594811f53c6fdac1",
-            "trainable_parameters": sum(p.numel() for p in trainable),
-            "task_instruction": TASK_INSTRUCTION,
-        })
-        write_json(args.output / "environment.json", {
-            name: version(name) for name in ["torch", "transformers", "peft", "lightning", "datasets", "tensorboard"]
-        } | {"cuda": torch.version.cuda, "device": str(fabric.device),
-             "python": sys.version,
-             "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else None})
+        fabric.logger.log_hyperparams({
+            key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()
+        } | {"world_size": fabric.world_size})
     fabric.barrier()
 
     # 训练前评测：记录初始策略在固定验证题上的正确率。
@@ -276,8 +252,7 @@ def main(args):
     optimizer_steps = 0
     completed_batches = 0
     last_validation_batch = 0
-    global_batch_size = args.batch_size * fabric.world_size
-    for batch_index, start in enumerate(range(0, len(train_rows), global_batch_size), 1):
+    for batch_index, start in enumerate(range(0, train_size, global_batch_size), 1):
         if args.steps and batch_index > args.steps:
             break
         batch = train_rows[start:start + global_batch_size]
@@ -285,24 +260,20 @@ def main(args):
         # 采样：每题生成 G 个回答，计算奖励和组内优势，并固定本批 πold 的概率。
         with fabric.autocast():
             samples = rollout(raw_model, tokenizer, local_rows, args)
-        real_count = len(samples)
-        pad_samples(samples, len(batch), args.group_size,
-                    prompt_ids(tokenizer, batch[0]["question"]), eos_ids(tokenizer)[0], fabric)
         update_metrics = []
         # 有非零优势或启用 KL 时才更新；否则本批不执行优化器步。
         if should_update(samples, args.beta, fabric):
             # 策略更新：重算 πθ 的概率，用优势、概率比、clip 和可选 KL 计算 loss。
             # 同批多次更新始终固定 πold；下一批才用更新后的策略重新采样。
             for update in range(args.updates_per_batch):
-                metrics = update_policy(model, optimizer, samples, real_count,
-                                        len(batch) * args.group_size, args, fabric)
+                metrics = update_policy(model, optimizer, samples, args, fabric)
                 optimizer_steps += 1
                 update_metrics.append({"update": update + 1, **metrics})
                 fabric.log_dict({f"update/{k}": v for k, v in metrics.items()} | {
                     "update/loss": metrics["policy_loss"] + args.beta * metrics.get("kl", 0.0),
                     "update/learning_rate": optimizer.param_groups[0]["lr"],
                 }, step=optimizer_steps)
-        log_batch(samples, real_count, len(batch), args.group_size, batch_index,
+        log_batch(samples, len(batch), args.group_size, batch_index,
                   optimizer_steps, update_metrics, args.output, fabric)
         completed_batches = batch_index
         if args.eval_every and batch_index % args.eval_every == 0:
@@ -327,8 +298,7 @@ def main(args):
             "peak_cuda_reserved_gib": torch.cuda.max_memory_reserved() / 1024**3 if torch.cuda.is_available() else None,
         })
     fabric.barrier()
-    for logger in fabric.loggers:
-        logger.finalize("success")
+    fabric.logger.finalize("success")
 
 
 if __name__ == "__main__":

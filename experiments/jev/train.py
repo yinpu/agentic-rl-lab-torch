@@ -2,8 +2,6 @@
 import argparse
 import os
 import json
-import hashlib
-import math
 from pathlib import Path
 import random
 import sys
@@ -19,35 +17,37 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "experiments.jev"
 
-from .data import Encoder, load_jsonl
-from .modeling import DEFAULT_MODEL, batch_decision_logits, load_model
+from .jev import DEFAULT_MODEL, Encoder, batch_decision_logits, load_jsonl, load_model
+
+
+def training_size(count, batch_size, world_size):
+    """只处理完整全局 batch；多卡时每卡分到相同数量的样本。"""
+    if world_size > 1 and batch_size % world_size:
+        raise ValueError("global batch size must be divisible by world size")
+    size = count // batch_size * batch_size
+    if size == 0:
+        raise ValueError("not enough training data for one batch; reduce batch size or add data")
+    return size
 
 
 def update(model, optimizer, examples, fabric, max_grad_norm=0.0, micro_batch_size=1):
     """按全局字段数归一；micro-batch 只改变并行计算，不改变更新目标。"""
     count = sum(len(e["targets"]) for e in examples)
-    slots = math.ceil(len(examples) / fabric.world_size)
     local = examples[fabric.global_rank::fabric.world_size]
     loss_sum = torch.zeros((), device=fabric.device)
     optimizer.zero_grad()
-    for start in range(0, slots, micro_batch_size):
-        # 所有 rank 使用相同槽位数，尾批空槽仍参与反向但权重为零。
-        chunk = [local[i] if i < len(local) else examples[0]
-                 for i in range(start, min(start + micro_batch_size, slots))]
-        with fabric.no_backward_sync(model, enabled=start + micro_batch_size < slots):
+    for start in range(0, len(local), micro_batch_size):
+        chunk = local[start:start + micro_batch_size]
+        with fabric.no_backward_sync(model, enabled=start + micro_batch_size < len(local)):
             logits = batch_decision_logits(model, chunk, fabric.device)
             losses = []
-            for i, (example, values) in enumerate(zip(chunk, logits, strict=True), start):
+            for example, values in zip(chunk, logits, strict=True):
                 targets = torch.tensor(example["targets"], device=fabric.device)
                 loss = F.cross_entropy(values, targets, reduction="sum")
-                real = i < len(local)
-                losses.append(loss * (fabric.world_size / count if real else 0.0))
-                if real:
-                    loss_sum += loss.detach()
+                losses.append(loss * fabric.world_size / count)
+                loss_sum += loss.detach()
             fabric.backward(torch.stack(losses).sum())
     norm = fabric.clip_gradients(model, optimizer, max_norm=max_grad_norm or float("inf"))
-    if not torch.isfinite(norm):
-        raise RuntimeError("non-finite gradient; optimizer step cancelled")
     optimizer.step()
     loss = fabric.all_reduce(loss_sum, reduce_op="sum") / count
     return {"loss": loss.item(), "supervised_tokens": count, "grad_norm": norm.item()}
@@ -71,6 +71,7 @@ def main(args):
         records = records[:args.max_samples]
     if not records:
         raise ValueError("empty training set")
+    train_size = training_size(len(records), args.batch_size, fabric.world_size)
     model, tokenizer = load_model(args.model, args.precision)
     encoder = Encoder(tokenizer)
     examples = [encoder.build_example(r, args.max_length) for r in records]
@@ -79,21 +80,14 @@ def main(args):
         lora_dropout=0.0, target_modules="all-linear", bias="none",
     ))
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-    if any("lora_" not in n for n, p in model.named_parameters() if p.requires_grad):
-        raise RuntimeError("only LoRA parameters should be trainable")
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=args.learning_rate, weight_decay=0.0)
     model, optimizer = fabric.setup(model, optimizer)
     if fabric.is_global_zero:
         args.output.mkdir(parents=True, exist_ok=True)
-        config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
-        config.update(world_size=fabric.world_size, records=len(records),
-                      fields=sum(len(e["targets"]) for e in examples),
-                      trainable_parameters=sum(p.numel() for p in trainable),
-                      data_sha256=hashlib.sha256(args.data.read_bytes()).hexdigest(),
-                      record_ids=[r.get("id") for r in records])
-        (args.output / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-        print(json.dumps(config, ensure_ascii=False), flush=True)
+        fabric.logger.log_hyperparams({
+            key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()
+        } | {"world_size": fabric.world_size})
     fabric.barrier()
 
     def save(name):
@@ -109,7 +103,7 @@ def main(args):
     for epoch in range(args.epochs):
         # 与参考脚本一致：在上个 epoch 顺序上再次 shuffle。
         random.Random(args.seed + epoch).shuffle(examples)
-        for start in range(0, len(examples), args.batch_size):
+        for start in range(0, train_size, args.batch_size):
             batch = examples[start:start + args.batch_size]
             metrics = update(model, optimizer, batch, fabric, args.max_grad_norm, args.micro_batch_size)
             step += 1
@@ -128,8 +122,7 @@ def main(args):
         if args.max_steps and step >= args.max_steps:
             break
     save("final")
-    for logger in fabric.loggers:
-        logger.finalize("success")
+    fabric.logger.finalize("success")
 
 
 def parse_args():
@@ -140,7 +133,7 @@ def parse_args():
     parser.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--micro-batch-size", type=int, default=1, help="每进程一次训练前向的样本数；不改变有效 batch")
-    parser.add_argument("--batch-size", type=int, default=16, help="全局案例数；各卡逐条累积")
+    parser.add_argument("--batch-size", type=int, default=16, help="全局案例数；各卡按 micro-batch 累积")
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--lora-rank", type=int, default=32)
     parser.add_argument("--lora-alpha", type=int, default=32)

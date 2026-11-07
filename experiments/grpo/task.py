@@ -204,17 +204,7 @@ def completion_logprobs(model, prompt, completion):
     不计算提示词 loss，也不含 padding。返回值保留模型的梯度图；计算旧策略
     或参考策略时，由调用方使用 no_grad() 固定这些概率。
     """
-    if not completion:
-        raise ValueError("Empty completion")
-    device = next(model.parameters()).device
-    inputs = torch.tensor([prompt + completion[:-1]], device=device)
-    targets = torch.tensor(completion, device=device)
-    # 最后 len(c) 个输入位置，从 prompt 最后一个 token 开始预测。
-    output = model(input_ids=inputs, attention_mask=torch.ones_like(inputs),
-                   use_cache=False, logits_to_keep=len(completion))
-    logits = output.logits[0]  # [T, V]，V 为词表大小；targets 为 [T]。
-    # 单 token 交叉熵 = -log π(目标 token)；先转 FP32 改善概率计算的数值稳定性。
-    return -F.cross_entropy(logits.float(), targets, reduction="none")
+    return batch_completion_logprobs(model, [{"prompt": prompt, "tokens": completion}])[0]
 
 
 def batch_completion_logprobs(model, samples):
@@ -222,6 +212,8 @@ def batch_completion_logprobs(model, samples):
 
     仅在回答预测位置的并集计算词表投影；prompt/padding 不参与 loss。
     """
+    if any(not sample["tokens"] for sample in samples):
+        raise ValueError("Empty completion")
     device = next(model.parameters()).device
     sequences = [s["prompt"] + s["tokens"][:-1] for s in samples]
     positions = [list(range(len(s["prompt"]) - 1, len(seq)))
