@@ -133,7 +133,7 @@ def write_json(path, value):
 def load_model(model_name, dtype=torch.bfloat16):
     """从本地路径或模型 ID 加载，返回 (model, tokenizer)，暂不搬到 GPU。
 
-    dtype 决定基础权重精度；设备放置由调用方或 Accelerate 负责。
+    dtype 决定基础权重精度；设备放置由调用方或 Fabric 负责。
     关闭 dropout，使旧/新策略的概率比较只反映参数变化。
     """
     model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype, attn_implementation="sdpa")
@@ -215,6 +215,34 @@ def completion_logprobs(model, prompt, completion):
     logits = output.logits[0]  # [T, V]，V 为词表大小；targets 为 [T]。
     # 单 token 交叉熵 = -log π(目标 token)；先转 FP32 改善概率计算的数值稳定性。
     return -F.cross_entropy(logits.float(), targets, reduction="none")
+
+
+def batch_completion_logprobs(model, samples):
+    """右侧补齐后共同前向；返回每条回答的有效 token logprob，保留 EOS。
+
+    仅在回答预测位置的并集计算词表投影；prompt/padding 不参与 loss。
+    """
+    device = next(model.parameters()).device
+    sequences = [s["prompt"] + s["tokens"][:-1] for s in samples]
+    positions = [list(range(len(s["prompt"]) - 1, len(seq)))
+                 for s, seq in zip(samples, sequences, strict=True)]
+    selected = torch.tensor(sorted({i for row in positions for i in row}), device=device)
+    width = max(map(len, sequences))
+    ids = torch.zeros((len(samples), width), dtype=torch.long, device=device)
+    mask = torch.zeros_like(ids)
+    for i, seq in enumerate(sequences):
+        ids[i, :len(seq)] = torch.tensor(seq, device=device)
+        mask[i, :len(seq)] = 1
+    logits = model(input_ids=ids, attention_mask=mask, use_cache=False,
+                   logits_to_keep=selected).logits
+    logprobs = []
+    for i, (sample, row_positions) in enumerate(zip(samples, positions, strict=True)):
+        # selected 是升序并集，searchsorted 将原序列位置映射回投影后的列号。
+        columns = torch.searchsorted(selected, torch.tensor(row_positions, device=device))
+        targets = torch.tensor(sample["tokens"], device=device)
+        logprobs.append(-F.cross_entropy(logits[i, columns].float(), targets, reduction="none"))
+    return logprobs
+
 
 
 def group_advantages(rewards, standardize=False):

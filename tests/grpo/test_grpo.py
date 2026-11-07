@@ -6,7 +6,7 @@ from datasets import Dataset
 from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import Qwen2Config, Qwen2ForCausalLM
 
-from task import (TASK_INSTRUCTION, completion_logprobs,
+from experiments.grpo.task import (TASK_INSTRUCTION, completion_logprobs,
                   extract_boxed, follows_think_format, ground_truth, group_advantages,
                   grpo_loss, make_split, prompt_ids, reward, training_rewards, trim_completion)
 
@@ -50,7 +50,7 @@ def test_training_reward_keeps_accuracy_and_format_separate(text, correct, forma
 
 @pytest.mark.parametrize("weight", ["-0.5", "nan", "inf"])
 def test_cli_rejects_invalid_format_reward_weight(monkeypatch, weight):
-    import train
+    from experiments.grpo import train
     monkeypatch.setattr("sys.argv", ["train.py", "--format-reward-weight", weight])
     with pytest.raises(SystemExit) as error:
         train.parse_args()
@@ -88,7 +88,7 @@ def test_prompt_has_only_current_problem():
 @pytest.mark.parametrize("weight", [0., 0.5])
 def test_rollout_combines_format_advantages_and_optional_fixed_reference(monkeypatch, beta, weight):
     from types import SimpleNamespace
-    import train
+    from experiments.grpo import train
 
     model = get_peft_model(tiny_model(), LoraConfig(task_type="CAUSAL_LM", r=2, lora_alpha=4,
                                                    target_modules="all-linear", lora_dropout=0.))
@@ -116,8 +116,8 @@ def test_training_and_evaluation_share_prompt_and_save_each_answer(monkeypatch, 
     import json
     from contextlib import nullcontext
     from types import SimpleNamespace
-    import evaluate
-    import train
+    from experiments.grpo import evaluate
+    from experiments.grpo import train
 
     tokenizer = RecordingTokenizer()
     model = tiny_model()
@@ -128,10 +128,10 @@ def test_training_and_evaluation_share_prompt_and_save_each_answer(monkeypatch, 
     samples = train.rollout(model, tokenizer, [row], args)
     assert [s["advantage"] for s in samples] == [0.5, -0.5]
     monkeypatch.setattr(evaluate, "generate", lambda *a, **k: [([7, 2], False)])
-    accelerator = SimpleNamespace(unwrap_model=lambda x: x, process_index=0, num_processes=1,
-                                  is_main_process=True, autocast=nullcontext,
-                                  wait_for_everyone=lambda: None)
-    metrics = evaluate.evaluate_model(model, tokenizer, [row], accelerator, 16, tmp_path / "eval.json")
+    fabric = SimpleNamespace(global_rank=0, world_size=1,
+                                  is_global_zero=True, autocast=nullcontext,
+                                  barrier=lambda: None)
+    metrics = evaluate.evaluate_model(model, tokenizer, [row], fabric, 16, tmp_path / "eval.json")
     assert tokenizer.calls[0] == tokenizer.calls[1]
     assert metrics["accuracy"] == metrics["think_format_rate"] == 1.
     final = json.loads((tmp_path / "eval.json").read_text())
@@ -261,57 +261,34 @@ def test_dataset_split_is_reproducible_and_disjoint():
     assert len(split["train"]) == 3 and len(split["validation"]) == 4
 
 
-def distributed_check():
-    """用 torchrun 在两个 CPU 进程运行，直接验证训练函数的尾批全局归约。"""
+
+@pytest.mark.parametrize("micro", [1, 2, 3])
+@pytest.mark.parametrize("beta", [0., .04])
+def test_batch_update_matches_sequence_mean(micro, beta):
+    from copy import deepcopy
     from types import SimpleNamespace
-    from accelerate import Accelerator, DistributedDataParallelKwargs
-    from train import pad_samples, should_update, update_policy
-
-    accelerator = Accelerator(cpu=True, kwargs_handlers=[DistributedDataParallelKwargs(broadcast_buffers=False)])
-    if accelerator.num_processes != 2:
-        raise ValueError("Run this check with torchrun --nproc_per_node=2")
-    args = SimpleNamespace(beta=0.04, clip=0.2, max_grad_norm=100.)
-    for prompts in [3, 1]:  # 3 题：各进程 2/1 题；1 题：一个进程完全没有真实题。
-        model = get_peft_model(tiny_model(), LoraConfig(task_type="CAUSAL_LM", r=2, lora_alpha=4,
-                                                       target_modules="all-linear", lora_dropout=0.))
-        expected = get_peft_model(tiny_model(), LoraConfig(task_type="CAUSAL_LM", r=2, lora_alpha=4,
-                                                          target_modules="all-linear", lora_dropout=0.))
-        expected.load_state_dict(model.state_dict())
-        trainable = [p for p in model.parameters() if p.requires_grad]
-        optimizer = torch.optim.SGD(trainable, lr=0.01)
-        model, optimizer = accelerator.prepare(model, optimizer)
-        expected_optimizer = torch.optim.SGD([p for p in expected.parameters() if p.requires_grad], lr=0.01)
-        all_samples = []
-        for i in range(prompts):
-            for tokens, advantage in [([7, 2], 0.5), ([8, 9, 2], -0.5)]:
-                prompt = [4, 5 + i]
-                with torch.no_grad():
-                    old = completion_logprobs(expected, prompt, tokens)
-                all_samples.append({"prompt": prompt, "tokens": tokens, "advantage": advantage,
-                                    "old": old, "reference": old})
-        samples = [s for i, s in enumerate(all_samples) if i // 2 % 2 == accelerator.process_index]
-        real_count = len(samples)
-        pad_samples(samples, prompts, 2, [4, 5], 2, accelerator)
-        # 包括本地无真实回答的进程，也必须与其他进程作出同一个更新决定。
-        assert should_update(samples, 0., accelerator)
-        zero_samples = [sample | {"advantage": 0.} for sample in samples]
-        assert not should_update(zero_samples, 0., accelerator)
-        assert should_update(zero_samples, args.beta, accelerator)
-        # 集中式完整 loss 独立计算，包含不同回答长度和冻结的 reference。
-        expected.train()
-        for sample in all_samples:
-            current = completion_logprobs(expected, sample["prompt"], sample["tokens"])
-            loss, _ = grpo_loss(current, sample["old"], sample["advantage"], sample["reference"], args.beta)
-            (loss / len(all_samples)).backward()
-        expected_optimizer.step()
-        update_policy(model, optimizer, trainable, samples, real_count, len(all_samples), args, accelerator)
-        for actual, target in zip(accelerator.unwrap_model(model).parameters(), expected.parameters(), strict=True):
-            torch.testing.assert_close(actual, target, atol=1e-6, rtol=1e-5)
-        # CPU/Gloo 不传 CUDA device_ids（Accelerate 1.15 的 barrier 会传）。
-        torch.distributed.barrier()
-        accelerator.print(f"CPU DDP: {prompts} prompts, tail normalization matches centralized update")
-    torch.distributed.destroy_process_group()
-
-
-if __name__ == "__main__":
-    distributed_check()
+    from lightning.fabric import Fabric
+    from experiments.grpo.task import batch_completion_logprobs
+    from experiments.grpo.train import update_policy
+    model = tiny_model()
+    reference = deepcopy(model)
+    samples = []
+    for prompt, tokens, advantage in [([4, 5], [7, 2], .5), ([4], [8, 9, 2], -.5), ([4, 6, 5], [2], 0.)]:
+        old = completion_logprobs(reference, prompt, tokens).detach() + .1
+        samples.append(dict(prompt=prompt, tokens=tokens, advantage=advantage, old=old, reference=old - .2))
+    for current, sample in zip(batch_completion_logprobs(model, samples), samples, strict=True):
+        torch.testing.assert_close(current, completion_logprobs(reference, sample["prompt"], sample["tokens"]))
+    for sample in samples:
+        current = completion_logprobs(reference, sample["prompt"], sample["tokens"])
+        loss, _ = grpo_loss(current, sample["old"], sample["advantage"], sample["reference"], beta)
+        (loss / 3).backward()
+    torch.optim.SGD(reference.parameters(), lr=.01).step()
+    fabric = Fabric(accelerator="cpu", devices=1)
+    fabric.launch()
+    optimizer = torch.optim.SGD(model.parameters(), lr=.01)
+    model, optimizer = fabric.setup(model, optimizer)
+    update_policy(model, optimizer, samples, 3, 3,
+                  SimpleNamespace(beta=beta, clip=.2, max_grad_norm=100., micro_batch_size=micro), fabric)
+    for p, q in zip(model.parameters(), reference.parameters(), strict=True):
+        torch.testing.assert_close(p.grad, q.grad, atol=1e-6, rtol=1e-5)
+        torch.testing.assert_close(p, q, atol=1e-6, rtol=1e-5)

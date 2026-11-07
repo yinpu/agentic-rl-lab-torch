@@ -50,7 +50,7 @@ L=\frac{1}{\sum_i |F_i|}\sum_i\sum_{f\in F_i}\ell_{i,f}.
 
 分母是**完整词表**。训练输入保留 marker，不将其替换成正确答案，所以后面的字段看不到前面字段的金标准答案。普通语言建模的“答案填入输入，再 mask labels”会改变这里的条件信息。
 
-[`modeling.py`](modeling.py) 的 `decision_logits` 用 `logits_to_keep` 仅在这些位置计算 lm_head，降低长序列的 logits 显存占用；[`train.py`](train.py) 的 `update` 对所选位置执行全词表交叉熵。一个全局 batch 内逐案例累积，以字段总数归一。它没有把每条记录的平均 loss 再平均，否则 ToolACE 的单字段记录与 Typed Decisions 的五字段记录会被错误加权。
+[`modeling.py`](modeling.py) 的 `decision_logits` 用 `logits_to_keep` 仅在这些位置计算 lm_head，降低长序列的 logits 显存占用；[`train.py`](train.py) 的 `update` 对所选位置执行全词表交叉熵。训练用 `batch_decision_logits` 将多个案例右侧补齐、共同前向，使用 attention mask，并只投影本批 marker 预测位置的并集。随后取各案例的实际字段，以全局字段总数归一。它没有把每条记录的平均 loss 再平均，否则 ToolACE 的单字段记录与 Typed Decisions 的五字段记录会被错误加权。
 
 ### 推理：只在候选之间归一化
 
@@ -110,7 +110,7 @@ python experiments/jev/prepare_data.py
 
 # 从原训练集取小子集，验证更新、保存与重载。
 python experiments/jev/train.py --model "$JEV_MODEL" \
-  --max-samples 16 --batch-size 4 --epochs 1 --max-steps 2 \
+  --max-samples 16 --batch-size 4 --micro-batch-size 2 --epochs 1 --max-steps 2 \
   --save-every 0 --output experiments/jev/runs/jev-smoke
 
 python experiments/jev/inference.py --model "$JEV_MODEL" \
@@ -120,7 +120,7 @@ python experiments/jev/inference.py --model "$JEV_MODEL" \
 
 训练先完整编码所选案例；超过 `--max-length` 默认 8192 会报出案例 ID 与 token 数，**不会静默截掉决策字段**。可增大长度或以 0 取消限制，实际可运行性取决于硬件与序列长度。Qwen3.5 的线性注意力未安装可选内核时会使用正确但较慢的 PyTorch 实现；本章不强制安装这些编译扩展。
 
-`--precision bf16` 是默认设置；CPU 或不支持 BF16 的硬件可传 `--precision fp32`。推理、校准与评测可用 `--device cpu`。训练设备由 Accelerate 决定。输出目录必须为空，重复实验换一个目录名。
+`--precision bf16` 是默认设置；CPU 或不支持 BF16 的硬件可传 `--precision fp32`。推理、校准与评测可用 `--device cpu`。训练设备由 Lightning Fabric 决定。输出目录必须为空，重复实验换一个目录名。
 
 ## 4. 完整训练、多卡与参数
 
@@ -137,7 +137,8 @@ torchrun --standalone --nproc_per_node=2 experiments/jev/train.py \
 | 参数 | 默认值与含义 |
 | --- | --- |
 | `--model` | `Qwen/Qwen3.5-0.8B`；可传本地目录，切换回参考 4B 时也使用此参数 |
-| `--batch-size` | 16 个全局案例；每卡每次只前向一个案例，通过梯度累积完成整批更新 |
+| `--batch-size` | 16 个全局案例；通过 micro-batch 累积完成整批更新 |
+| `--micro-batch-size` | 1；每进程一次前向的案例数，可设为 2；不改变全局 batch 或字段权重 |
 | `--epochs` | 2；每轮按 seed+epoch 打乱当前顺序 |
 | `--learning-rate` | 1e-4；恒定学习率，没有额外 warmup 或 scheduler |
 | `--lora-rank` / `--lora-alpha` | 32 / 32；文本骨干 `all-linear`，dropout=0、无 bias 训练 |
@@ -146,6 +147,8 @@ torchrun --standalone --nproc_per_node=2 experiments/jev/train.py \
 | `--save-every` | 每 60 步保存；0 关闭步骤保存，各轮结束和 final 仍保存 |
 
 优化器是 AdamW，weight_decay=0（等价于无权重衰减的 Adam），betas=(0.9,0.999)、eps=1e-8。只训练 LoRA，冻结基础模型与 lm_head，启用非 reentrant 梯度检查点。Transformers 加载 Qwen3.5 的文本骨干，不加载视觉塔。
+
+训练循环使用 Fabric 的 `setup`、`backward`、`clip_gradients` 和日志接口；只有最后一个 micro-batch 同步梯度。显存不足时调小 micro-batch，不自动改变全局 batch。
 
 DDP 会平均各卡梯度，所以 `update` 对本卡每个字段的 CE 乘 `world_size / 全局字段数`。尾批保留，卡间案例数不等时用零权重占位，让各卡执行相同次数的 backward，避免重复样本进入目标函数。相对于参考脚本丢弃不足一批的尾部，这是显式差异；默认 2160/16 整除时没有影响。
 
@@ -197,3 +200,25 @@ python experiments/jev/evaluate.py --model "$JEV_MODEL" \
 校准和评测的 `--limit` 仅供检查流程；限量输出不可充当全量基准。完整训练前后的基础模型对照、不同随机种子和 Hard 分布泛化，需要实际实验后再下结论。本章已完成 0.8B 的少量单卡更新、重载、限量校准与评测，尚未完成全量训练与基准对照，真实多 GPU 训练尚未验证。
 
 `data.py`、`prepare_data.py` 和固定模板改编或复制自上述 Datawhale 参考 commit，许可证保留在 [LICENSE.upstream](LICENSE.upstream)。数据各自遵循原数据源的许可证。模型 API 依据 [Transformers Qwen3.5 文档](https://huggingface.co/docs/transformers/en/model_doc/qwen3_5)，实际依赖版本以根目录锁定文件为准。
+
+## 验证与试跑（2026-11-07）
+
+算法检查使用小随机模型验证 token 对齐、padding 排除及正确的全局归约，不作为任务效果。两进程 CPU DDP 覆盖了尾批和没有真实样本的 rank；真实多 GPU 训练仍未验证。
+
+真实 Qwen3.5-0.8B 已在原任务两条记录上，以 micro-batch=2 完成一次更新和 adapter 保存，并重载执行两条 dev 案例推理。没有全量训练或基准效果结论。
+
+短样本计时使用本机 RTX 4070 Ti SUPER 16GB、BF16、LoRA rank=32、梯度检查点和相同的四条样本；预热一次后，对三次更新计时并同步 CUDA。只测更新阶段，排除模型加载、生成、验证和保存。
+
+| micro-batch | 秒/更新 | 样本/秒 | 峰值已分配显存 GiB |
+| --- | --- | --- | --- |
+| 1 | 0.470 | 8.51 | 3.93 |
+| 2 | 0.347 | 11.51 | 6.10 |
+
+样本构造、长度和原始数值见 [fabric-validation.json](fabric-validation.json)。Jev 使用训练文件前 16 条案例中最短的四条，字段数均为 1；线性注意力使用未安装可选加速内核时的 PyTorch 实现。这些短测量只说明批处理在本次输入上的收益，不代表完整训练加速比；不同长度、padding 比例和硬件可能产生不同结果。
+
+验证命令：
+
+```bash
+.venv/bin/python -m pytest tests/jev/test_jev.py -q
+.venv/bin/torchrun --standalone --nproc_per_node=2 tests/jev/check_ddp.py
+```

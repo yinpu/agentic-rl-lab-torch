@@ -36,6 +36,27 @@ def decision_logits(model, example, device):
     return model(input_ids=ids, use_cache=False, logits_to_keep=positions).logits[0].float()
 
 
+def batch_decision_logits(model, examples, device):
+    """批量右补齐；仅投影 marker 前一位置的并集，再取各案例实际字段。"""
+    width = max(len(e["input_ids"]) for e in examples)
+    ids = torch.zeros((len(examples), width), dtype=torch.long, device=device)
+    mask = torch.zeros_like(ids)
+    selected = torch.tensor(sorted({p for e in examples for p in e["positions"]}), device=device)
+    for i, example in enumerate(examples):
+        n = len(example["input_ids"])
+        ids[i, :n] = torch.tensor(example["input_ids"], device=device)
+        mask[i, :n] = 1
+    logits = model(input_ids=ids, attention_mask=mask, use_cache=False,
+                   logits_to_keep=selected).logits
+    field_logits = []
+    for i, example in enumerate(examples):
+        positions = torch.tensor(example["positions"], device=device)
+        columns = torch.searchsorted(selected, positions)
+        field_logits.append(logits[i, columns].float())
+    return field_logits
+
+
+
 def identity(model_name, adapter):
     name = str(Path(model_name).resolve()) if Path(model_name).exists() else model_name
     result = {"model": name, "adapter_sha256": None}

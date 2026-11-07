@@ -7,3 +7,4 @@ tensorboard==2.20.0
 datasets==5.1.0
 modelscope==1.40.2
 pytest==9.2.0
+lightning==2.6.6

@@ -152,3 +152,34 @@ def test_calibration_identity_is_checked_before_loading(tmp_path, monkeypatch):
                                     str(calibration), "--output", str(tmp_path / "eval.json")])
     with pytest.raises(ValueError, match="different model/adapter"):
         evaluate.main()
+
+
+@pytest.mark.parametrize("micro", [1, 2, 3])
+def test_batch_update_matches_field_mean(micro):
+    from copy import deepcopy
+    from lightning.fabric import Fabric
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+    from experiments.jev.modeling import batch_decision_logits
+    from experiments.jev.train import update
+    torch.manual_seed(8)
+    model = Qwen2ForCausalLM(Qwen2Config(vocab_size=80, hidden_size=16, intermediate_size=24,
+                                      num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=2)).eval()
+    reference = deepcopy(model)
+    examples = [{"input_ids": [1, 2, 3, 4, 5], "positions": [1, 3], "targets": [61, 62]},
+                {"input_ids": [6, 7, 8], "positions": [1], "targets": [63]},
+                {"input_ids": [9, 10, 11, 12], "positions": [0, 2], "targets": [64, 65]}]
+    for actual, e in zip(batch_decision_logits(model, examples, "cpu"), examples, strict=True):
+        torch.testing.assert_close(actual, decision_logits(reference, e, "cpu"))
+    expected_loss = sum(F.cross_entropy(decision_logits(reference, e, "cpu"), torch.tensor(e["targets"]), reduction="sum") for e in examples) / 5
+    expected_loss.backward()
+    ref_opt = torch.optim.SGD(reference.parameters(), lr=.1)
+    ref_opt.step()
+    fabric = Fabric(accelerator="cpu", devices=1)
+    fabric.launch()
+    optimizer = torch.optim.SGD(model.parameters(), lr=.1)
+    model, optimizer = fabric.setup(model, optimizer)
+    metrics = update(model, optimizer, examples, fabric, micro_batch_size=micro)
+    assert metrics["loss"] == pytest.approx(expected_loss.item(), abs=1e-6)
+    for p, q in zip(model.parameters(), reference.parameters(), strict=True):
+        torch.testing.assert_close(p.grad, q.grad, atol=1e-6, rtol=1e-5)
+        torch.testing.assert_close(p, q, atol=1e-6, rtol=1e-5)

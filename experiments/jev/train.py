@@ -1,6 +1,6 @@
 """LoRA masked SFT。一个全局 batch 内按案例累积，按决策字段数归一。"""
 import argparse
-from contextlib import nullcontext
+import os
 import json
 import hashlib
 import math
@@ -10,8 +10,9 @@ import sys
 
 import torch
 import torch.nn.functional as F
-from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs, set_seed
+from lightning.fabric import Fabric
+from lightning.fabric.strategies import DDPStrategy
+from lightning.fabric.loggers import TensorBoardLogger
 from peft import LoraConfig, get_peft_model
 
 if __package__ in (None, ""):
@@ -19,46 +20,50 @@ if __package__ in (None, ""):
     __package__ = "experiments.jev"
 
 from .data import Encoder, load_jsonl
-from .modeling import DEFAULT_MODEL, decision_logits, load_model
+from .modeling import DEFAULT_MODEL, batch_decision_logits, load_model
 
 
-def update(model, optimizer, examples, accelerator, max_grad_norm=0.0):
-    """DDP 梯度会平均，故每个字段的 CE 乘 world_size / 全局字段数。"""
+def update(model, optimizer, examples, fabric, max_grad_norm=0.0, micro_batch_size=1):
+    """按全局字段数归一；micro-batch 只改变并行计算，不改变更新目标。"""
     count = sum(len(e["targets"]) for e in examples)
-    slots = math.ceil(len(examples) / accelerator.num_processes)
-    local = examples[accelerator.process_index::accelerator.num_processes]
-    loss_sum = torch.zeros((), device=accelerator.device)
+    slots = math.ceil(len(examples) / fabric.world_size)
+    local = examples[fabric.global_rank::fabric.world_size]
+    loss_sum = torch.zeros((), device=fabric.device)
     optimizer.zero_grad()
-    for slot in range(slots):
-        real = slot < len(local)
-        example = local[slot] if real else examples[0]
-        context = accelerator.no_sync(model) if slot < slots - 1 else nullcontext()
-        with context:
-            logits = decision_logits(model, example, accelerator.device)
-            targets = torch.tensor(example["targets"], device=accelerator.device)
-            loss = F.cross_entropy(logits, targets, reduction="sum")
-            scale = accelerator.num_processes / count if real else 0.0
-            accelerator.backward(loss * scale)
-        if real:
-            loss_sum += loss.detach()
-    parameters = [p for p in model.parameters() if p.requires_grad]
-    norm = accelerator.clip_grad_norm_(parameters, max_grad_norm or float("inf"))
+    for start in range(0, slots, micro_batch_size):
+        # 所有 rank 使用相同槽位数，尾批空槽仍参与反向但权重为零。
+        chunk = [local[i] if i < len(local) else examples[0]
+                 for i in range(start, min(start + micro_batch_size, slots))]
+        with fabric.no_backward_sync(model, enabled=start + micro_batch_size < slots):
+            logits = batch_decision_logits(model, chunk, fabric.device)
+            losses = []
+            for i, (example, values) in enumerate(zip(chunk, logits, strict=True), start):
+                targets = torch.tensor(example["targets"], device=fabric.device)
+                loss = F.cross_entropy(values, targets, reduction="sum")
+                real = i < len(local)
+                losses.append(loss * (fabric.world_size / count if real else 0.0))
+                if real:
+                    loss_sum += loss.detach()
+            fabric.backward(torch.stack(losses).sum())
+    norm = fabric.clip_gradients(model, optimizer, max_norm=max_grad_norm or float("inf"))
     if not torch.isfinite(norm):
         raise RuntimeError("non-finite gradient; optimizer step cancelled")
     optimizer.step()
-    loss = accelerator.reduce(loss_sum, reduction="sum") / count
+    loss = fabric.all_reduce(loss_sum, reduce_op="sum") / count
     return {"loss": loss.item(), "supervised_tokens": count, "grad_norm": norm.item()}
 
 
 def main(args):
-    accelerator = Accelerator(
-        mixed_precision="bf16" if args.precision == "bf16" else "no",
-        log_with="tensorboard", project_dir=str(args.output),
-        kwargs_handlers=[DistributedDataParallelKwargs(broadcast_buffers=False)],
+    # torchrun 提供进程数；直接 python 启动时使用单设备。
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    fabric = Fabric(
+        accelerator="cuda" if torch.cuda.is_available() else "cpu", devices=world_size,
+        strategy=DDPStrategy(broadcast_buffers=False) if world_size > 1 else "auto",
+        precision="bf16-mixed" if args.precision == "bf16" else "32-true",
+        loggers=TensorBoardLogger(str(args.output), name="tensorboard", version=""),
     )
-    if accelerator.gradient_accumulation_steps != 1:
-        raise ValueError("unset ACCELERATE_GRADIENT_ACCUMULATION_STEPS; accumulation is explicit")
-    set_seed(args.seed)
+    fabric.launch()
+    fabric.seed_everything(args.seed)
     if args.output.exists() and any(args.output.iterdir()):
         raise ValueError(f"output is not empty: {args.output}; choose a new directory")
     records = load_jsonl(args.data)
@@ -78,29 +83,26 @@ def main(args):
         raise RuntimeError("only LoRA parameters should be trainable")
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=args.learning_rate, weight_decay=0.0)
-    model, optimizer = accelerator.prepare(model, optimizer)
-    if accelerator.is_main_process:
+    model, optimizer = fabric.setup(model, optimizer)
+    if fabric.is_global_zero:
         args.output.mkdir(parents=True, exist_ok=True)
         config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
-        config.update(world_size=accelerator.num_processes, records=len(records),
+        config.update(world_size=fabric.world_size, records=len(records),
                       fields=sum(len(e["targets"]) for e in examples),
                       trainable_parameters=sum(p.numel() for p in trainable),
                       data_sha256=hashlib.sha256(args.data.read_bytes()).hexdigest(),
                       record_ids=[r.get("id") for r in records])
         (args.output / "config.json").write_text(json.dumps(config, indent=2) + "\n")
         print(json.dumps(config, ensure_ascii=False), flush=True)
-    accelerator.wait_for_everyone()
-    accelerator.init_trackers("tensorboard", config={
-        k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
-    })
+    fabric.barrier()
 
     def save(name):
-        accelerator.wait_for_everyone()
-        if accelerator.is_main_process:
+        fabric.barrier()
+        if fabric.is_global_zero:
             folder = args.output / name
-            accelerator.unwrap_model(model).save_pretrained(folder, safe_serialization=True)
+            model.module.save_pretrained(folder, safe_serialization=True)
             tokenizer.save_pretrained(folder)
-        accelerator.wait_for_everyone()
+        fabric.barrier()
 
     step = 0
     model.train()
@@ -109,13 +111,13 @@ def main(args):
         random.Random(args.seed + epoch).shuffle(examples)
         for start in range(0, len(examples), args.batch_size):
             batch = examples[start:start + args.batch_size]
-            metrics = update(model, optimizer, batch, accelerator, args.max_grad_norm)
+            metrics = update(model, optimizer, batch, fabric, args.max_grad_norm, args.micro_batch_size)
             step += 1
-            if accelerator.is_main_process:
+            if fabric.is_global_zero:
                 metrics.update(step=step, epoch=epoch + 1, records=len(batch))
                 with (args.output / "train.jsonl").open("a") as f:
                     f.write(json.dumps(metrics) + "\n")
-                accelerator.log({f"train/{k}": v for k, v in metrics.items() if k != "step"}
+                fabric.log_dict({f"train/{k}": v for k, v in metrics.items() if k != "step"}
                                 | {"train/learning_rate": optimizer.param_groups[0]["lr"]}, step=step)
                 print(json.dumps(metrics), flush=True)
             if args.save_every and step % args.save_every == 0:
@@ -126,7 +128,8 @@ def main(args):
         if args.max_steps and step >= args.max_steps:
             break
     save("final")
-    accelerator.end_training()
+    for logger in fabric.loggers:
+        logger.finalize("success")
 
 
 def parse_args():
@@ -136,6 +139,7 @@ def parse_args():
     parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parent / "runs/jev")
     parser.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")
     parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--micro-batch-size", type=int, default=1, help="每进程一次训练前向的样本数；不改变有效 batch")
     parser.add_argument("--batch-size", type=int, default=16, help="全局案例数；各卡逐条累积")
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--lora-rank", type=int, default=32)
@@ -147,7 +151,7 @@ def parse_args():
     parser.add_argument("--save-every", type=int, default=60)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
-    for key in ("epochs", "batch_size", "lora_rank", "lora_alpha"):
+    for key in ("micro_batch_size", "epochs", "batch_size", "lora_rank", "lora_alpha"):
         if getattr(args, key) <= 0:
             parser.error(f"--{key.replace('_', '-')} must be positive")
     for key in ("max_samples", "max_steps", "save_every", "max_length", "max_grad_norm"):

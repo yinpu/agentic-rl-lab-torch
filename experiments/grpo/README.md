@@ -2,12 +2,12 @@
 
 这一章研究一个具体问题：给模型同一道数学题的多个回答打分，能否改善它在未参与训练的题目上的表现？先使用最终答案正确性奖励，再分别对照加入 KL 约束和格式奖励的影响。
 
-任务与判分规则参考 [agentic-rl-lab 的 GRPO 章节](https://github.com/datawhalechina/agentic-rl-lab/tree/8493321013c02eef6cf79ca2594811f53c6fdac1/experiments/grpo)。本章使用 Qwen2.5-0.5B Base 和无示例的 think + boxed 提示词。Transformers 加载和生成，PEFT 管理 LoRA，Accelerate 处理设备和 DDP；优势、概率比、clip、KL 和更新循环都直接放在本章代码里。
+任务与判分规则参考 [agentic-rl-lab 的 GRPO 章节](https://github.com/datawhalechina/agentic-rl-lab/tree/8493321013c02eef6cf79ca2594811f53c6fdac1/experiments/grpo)。本章使用 Qwen2.5-0.5B Base 和无示例的 think + boxed 提示词。Transformers 加载和生成，PEFT 管理 LoRA，Fabric 处理设备和 DDP；优势、概率比、clip、KL 和更新循环都直接放在本章代码里。
 
 从项目根目录执行下文命令。文件之间的关系是：
 
 - `task.py`：提示词、奖励、数据划分、模型加载和 GRPO 公式。
-- `train.py`：采样、缓存旧概率、逐回答反向传播、评测与保存。
+- `train.py`：采样、缓存旧概率、按 micro-batch 反向传播、评测与保存。
 - `evaluate.py`：用同一任务定义独立评测基础模型或保存的 LoRA。
 
 ## 先沿公式阅读代码
@@ -193,7 +193,7 @@ policy = -torch.minimum(unclipped, clipped)
 L=\frac{1}{N}\sum_{i=1}^{N}\frac{1}{T_i}\sum_{t=1}^{T_i}\ell_{i,t}.
 \]
 
-逐回答 backward 是显存上的拆分，所有回答累积完才执行 optimizer step，算法上仍是这一个全局均值。默认 AdamW 的学习率为 `4e-5`、betas 为 `(0.9, 0.95)`、weight decay 为 0；梯度范数上限 1。
+按 micro-batch backward 是显存上的拆分，所有回答累积完才执行 optimizer step，算法上仍是这一个全局均值。默认 AdamW 的学习率为 `4e-5`、betas 为 `(0.9, 0.95)`、weight decay 为 0；梯度范数上限 1。
 
 默认每批只更新一次。更新前 current 与 old 相同，ratio 应接近 1，clip 通常尚未触发。`--updates-per-batch` 可让同一批数据重复更新以观察 ratio 变化，但这改变了参考实验的训练预算。不要根据单次更新实验宣称已验证 clipping 的收益。
 
@@ -229,10 +229,10 @@ KL 直接加入 loss，不混进奖励再计算组内优势。它是采样 token
 
 ## 从 loss 到参数更新
 
-`train.py::update_policy` 对每条回答重新计算当前策略概率，随后调用上面的同一个 `grpo_loss`：
+`train.py::update_policy` 批量重新计算当前策略概率，随后调用上面的同一个 `grpo_loss`：
 
 ```python
-current = completion_logprobs(model, sample["prompt"], sample["tokens"])
+currents = batch_completion_logprobs(model, chunk)
 ```
 
 `old` 和可选的 `reference` 从 rollout 记录搬到当前设备后，传给：
@@ -242,7 +242,7 @@ loss, metrics = grpo_loss(current, old, sample["advantage"], reference,
                           args.beta if real else 0.0, args.clip)
 ```
 
-单进程时，每条真实回答的 loss 乘 $1/N$，再调用 `accelerator.backward(loss * weight)`。所有回答反传完才统一裁剪梯度、检查有限性并执行 `optimizer.step()`。因此两个平均分别位于 `grpo_loss` 的 `.mean()` 和 `update_policy` 的回答权重中，不是每条回答更新一次参数。
+单进程时，每条真实回答的 loss 乘 $1/N$，将一个 micro-batch 的加权 loss 相加，再调用 `fabric.backward(torch.stack(weighted_losses).sum())`。所有回答反传完才统一裁剪梯度、检查有限性并执行 `optimizer.step()`。因此两个平均分别位于 `grpo_loss` 的 `.mean()` 和 `update_policy` 的回答权重中，不是每条回答更新一次参数。
 
 主循环中 `updates_per_batch` 次更新复用本批回答及固定的 old/reference；下一批才重新采样。无奖励优势且没有 KL 时跳过更新，采样批次数与实际优化步数分别记录。
 
@@ -302,6 +302,8 @@ GSM8K 首次运行由 Datasets 自动下载到 `.cache/datasets`。本章运行�
   --batch-size 4 --group-size 8 \
   --max-tokens 1024 --eval-limit 0
 ```
+
+`--micro-batch-size` 默认 1，表示每进程一次训练前向的回答数。试跑可加 `--micro-batch-size 2`；显存不足时调回 1。它不改变每题回答数或每次更新的有效 batch。一个 micro-batch 内右侧补齐，attention mask 排除 padding 的影响，只提取回答预测位置的 logprob；EOS 仍参与 loss，prompt 和 padding 不参与。
 
 `--steps 0`（默认）遍历排除验证题后的训练集一遍。`--train-limit N` 取其中前 N 题；`--steps N` 限制采样批次数，不会循环重复数据凑步数。`--batch-size` 是**每进程题数**，不是回答数；一次全局完整批次有 `进程数 × batch-size × group-size` 条回答。
 
@@ -393,9 +395,9 @@ GSM8K 首次运行由 Datasets 自动下载到 `.cache/datasets`。本章运行�
 - `log_batch`：只收集真实回答，汇总并写入日志；占位项不进入指标。
 - `save_adapter`：仅主进程保存适配器与 tokenizer，调用方安排同步。
 
-`update_policy` 中，前面的回答使用 `no_sync` 在本地累积，最后一条反传才同步。若全局有 $N$ 条真实回答、$W$ 个进程，每条真实回答的权重为 $W/N$，占位项为 0；DDP 再对进程梯度求平均，得到 $\frac{1}{N}\sum_i\nabla L_i$。单进程时自然退化为 $1/N$。这是回答平均在多进程下的实现，不改变前面定义的目标。
+`update_policy` 中，前面的 micro-batch 使用 `fabric.no_backward_sync` 在本地累积，最后一个 micro-batch 反传才同步。若全局有 $N$ 条真实回答、$W$ 个进程，每条真实回答的权重为 $W/N$，占位项为 0；DDP 再对进程梯度求平均，得到 $\frac{1}{N}\sum_i\nabla L_i$。单进程时自然退化为 $1/N$。这是回答平均在多进程下的实现，不改变前面定义的目标。
 
-模型加载时关闭 dropout，LoRA dropout 也为 0。BF16/FP32 由参数选择，Accelerate 负责训练前向的精度；绕过包装器的采样与评测显式使用同样的 autocast。梯度检查点通过反传时重算激活减少显存占用。逐回答反传避免保留整批计算图，但批处理效率受限。
+模型加载时关闭 dropout，LoRA dropout 也为 0。BF16/FP32 由参数选择，Fabric 负责训练前向的精度；绕过包装器的采样与评测显式使用同样的 autocast。梯度检查点通过反传时重算激活减少显存占用。`--micro-batch-size` 控制同时保留多少条回答的计算图；增加它可能提高吞吐量，也会增加显存和 padding 开销。
 
 训练产物保存在 `--output`：配置与实际任务指令、依赖版本、划分索引、训练 JSONL、实际 rollout、训练前后逐题验证结果，以及最终的 `adapter/`。每次定期验证前还会保存 `adapter-batch-N/`，可用 `evaluate.py --adapter` 单独评测；检查点仅含模型适配器与 tokenizer，不含优化器或随机数状态，不支持完整恢复训练。评测逐题写入 `*.rank-N.jsonl`，完整结束后汇总为 JSON；中止时已完成的题目仍保留，但未实现自动断点续评。使用新目录启动，避免覆盖旧实验。
 
@@ -409,4 +411,26 @@ GSM8K 首次运行由 Datasets 自动下载到 `.cache/datasets`。本章运行�
 
 在浏览器打开 `http://localhost:6006` 查看训练曲线。
 
-进一步阅读：[DeepSeekMath 论文](https://arxiv.org/abs/2402.03300)、[PEFT LoRA](https://huggingface.co/docs/peft/package_reference/lora)、[Accelerate 梯度同步](https://huggingface.co/docs/accelerate/concept_guides/gradient_synchronization)。
+进一步阅读：[DeepSeekMath 论文](https://arxiv.org/abs/2402.03300)、[PEFT LoRA](https://huggingface.co/docs/peft/package_reference/lora)、[Fabric 梯度累积](https://lightning.ai/docs/fabric/stable/advanced/gradient_accumulation.html)。
+
+## 验证与试跑（2026-11-07）
+
+算法检查使用小随机模型验证 token 对齐、padding 排除及正确的全局归约，不作为任务效果。两进程 CPU DDP 覆盖了尾批和没有真实样本的 rank；真实多 GPU 训练仍未验证。
+
+真实 Qwen2.5-0.5B 已执行一题、每题两条回答的短生成试跑（32 token 上限），完成训练前后验证、日志和 adapter 保存。该批回答全错且优势为零，KL 初值也为零，因此本次自由采样只验证流程；非零 LoRA 更新、KL/格式奖励分支及保存重载由 CUDA 检查中的受控 GSM8K 回答验证。该题两条回答的训练生成耗时约 0.525 秒，不含验证和更新。
+
+短样本计时使用本机 RTX 4070 Ti SUPER 16GB、BF16、LoRA rank=32、梯度检查点和相同的四条样本；预热一次后，对三次更新计时并同步 CUDA。只测更新阶段，排除模型加载、生成、验证和保存。
+
+| micro-batch | 秒/更新 | 样本/秒 | 峰值已分配显存 GiB |
+| --- | --- | --- | --- |
+| 1 | 0.326 | 12.25 | 1.33 |
+| 2 | 0.164 | 24.44 | 1.41 |
+
+样本构造、长度和原始数值见 [fabric-validation.json](fabric-validation.json)。GRPO 使用前两道 GSM8K 训练题的参考解答及固定错误回答，不是自由采样轨迹。这些短测量只说明批处理在本次输入上的收益，不代表完整训练加速比；不同长度、padding 比例和硬件可能产生不同结果。
+
+验证命令：
+
+```bash
+.venv/bin/python -m pytest tests/grpo/test_grpo.py tests/grpo/test_grpo_gpu.py -q
+.venv/bin/torchrun --standalone --nproc_per_node=2 tests/grpo/check_ddp.py
+```
