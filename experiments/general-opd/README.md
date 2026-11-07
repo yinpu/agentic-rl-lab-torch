@@ -46,10 +46,10 @@ $$
 令 $\rho_t=\exp(\log\pi_\theta-\log\pi_{\mathrm{old}})$，全局 batch 有 $N$ 个有效回答 token，更新目标为：
 
 $$
-L=-\frac{1}{N}\sum_{i,t}\rho_{i,t}\operatorname{stopgrad}(A_{i,t}).
+L=-\frac{1}{N}\sum_{i,t}\rho_{i,t}\mathrm{stopgrad}(A_{i,t}).
 $$
 
-这里 $\operatorname{stopgrad}$ 表示把优势当作常量，不沿教师或旧策略概率反传。损失只包含回答 token，保留首个 EOS，排除 prompt 和 padding；长回答按有效 token 数贡献更多项。概率比按 token 计算，没有裁剪。
+这里 $\mathrm{stopgrad}$ 表示把优势当作常量，不沿教师或旧策略概率反传。损失只包含回答 token，保留首个 EOS，排除 prompt 和 padding；长回答按有效 token 数贡献更多项。概率比按 token 计算，没有裁剪。
 
 上述梯度解释以已采样前缀为固定上下文。本章每个位置仅使用当前 token 的对数概率差，没有把后续 token 的差值累计成回报，也没有对学生改变前缀分布的影响求完整策略梯度。因此这里优化的是学生访问状态上的局部 token 蒸馏目标，不能直接等同于完整序列 KL 的无偏梯度。
 

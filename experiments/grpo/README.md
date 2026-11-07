@@ -46,7 +46,7 @@ $$
 $$
 \bar r=\frac{1}{G}\sum_{j=1}^{G}r_j,
 \qquad
-A_i=\frac{r_i-\bar r}{\operatorname{std}(r_1,\ldots,r_G)+10^{-8}}.
+A_i=\frac{r_i-\bar r}{\mathrm{std}(r_1,\ldots,r_G)+10^{-8}}.
 $$
 
 组内均值充当 baseline，无需训练 critic。这里使用总体标准差，同一回答的所有有效 token 共用 $A_i$。例如奖励 `[1, 0, 1, 0]` 得到优势约 `[1, -1, 1, -1]`；奖励全相同时，优势为零。
@@ -65,7 +65,7 @@ $$
 $$
 \ell^{\mathrm{policy}}_{i,t}=-\min\left(
 \rho_{i,t}A_i,
-\operatorname{clip}(\rho_{i,t},1-\epsilon,1+\epsilon)A_i
+\mathrm{clip}(\rho_{i,t},1-\epsilon,1+\epsilon)A_i
 \right).
 $$
 
