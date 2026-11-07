@@ -4,6 +4,8 @@
 
 Jev 将语言模型用于固定候选决策：输入状态和若干问题，一次前向计算各字段的候选概率。例如，同一张工单同时决定负责团队、优先级和是否退款。本章使用 Qwen3.5-0.8B，通过 LoRA masked SFT 学习决策。
 
+这里的决策学习是监督学习：每个字段的正确选项由训练数据给出，模型学习在指定位置预测该选项的单 token 符号。无需采样完整回答，也没有奖励、优势或策略梯度。LoRA 冻结基础模型权重，只训练线性层的低秩增量；候选编码决定输入形式，masked SFT 决定哪些位置产生训练信号。
+
 ### 候选编码与占位骨架
 
 一条数据包含 `state`、`questions` 和训练标签 `targets`：
@@ -37,6 +39,8 @@ system 提示词要求用符号作答，user 提示词包含状态和决策 sche
 
 `decision` 是 tokenizer 已有的单 token，占据各字段的决策位置。普通文本分段编码，marker 直接以 token ID 插入，不与字段名或引号一起分词。训练和推理共用这一编码方式及 [固定模板](templates/qwen3_5_jev.jinja)，assistant 前包含空的 `<think>` 块。输入始终保留占位符，后面的字段看到的是前面字段的占位符。
 
+因果模型的一个前向过程会同时计算所有输入位置的 logits，因此可以在一次前向中读取多个字段的预测。后续字段看到前面字段的 marker，而非它们的预测结果；各字段共享状态与 schema，但不会在本次前向里按已选答案逐字段条件化。这种输出是多个字段的候选分布，不是逐 token 生成的 JSON 联合概率。
+
 ### 训练：marker 位置的全词表交叉熵
 
 设第 $f$ 个字段的 marker 下标为 $m_f$，正确候选符号为 $y_f$。因果语言模型使用位置 $m_f-1$ 的 logits 预测它：
@@ -47,11 +51,11 @@ $$
 L=\frac{1}{\sum_i|F_i|}\sum_i\sum_{f\in F_i}\ell_{i,f}.
 $$
 
-训练 softmax 的分母覆盖完整词表，只在 marker 的预测位置计算监督损失。全局 batch 内每个字段等权，因此五字段案例贡献五项损失，单字段案例贡献一项。
+训练 softmax 的分母覆盖完整词表，只在 marker 的预测位置计算监督损失。全局 batch 内每个字段等权，因此五字段案例贡献五项损失，单字段案例贡献一项。这里 $V$ 是完整词表，$F_i$ 是第 $i$ 条案例的字段集合，$z$ 是模型输出的未归一化分数。marker 留在输入中，标签则是正确候选符号；prompt、骨架文本和 padding 均不作为训练目标。
 
 ### 推理：候选内归一化
 
-推理使用同一骨架，一次前向提取所有字段的候选 logits。对于候选集合 $C_f$ 和温度 $T>0$：
+推理使用同一骨架，一次前向提取所有字段的候选 logits。对于候选集合 $C_f$ 和温度 $T\gt 0$：
 
 $$
 p_f(c;T)=\frac{\exp(z_{m_f-1,c}/T)}{\sum_{c'\in C_f}\exp(z_{m_f-1,c'}/T)}.
@@ -66,10 +70,12 @@ $$
 温度校准在 calibration 划分上最小化字段平均 NLL：
 
 $$
-T^*=\arg\min_{T>0}\frac{1}{M}\sum_{f=1}^{M}-\log p_f(y_f;T).
+T^*=\arg\min_{T\gt 0}\frac{1}{M}\sum_{f=1}^{M}-\log p_f(y_f;T).
 $$
 
-正温度保持 argmax，调整预测置信度。
+推理的分母只包含本字段允许的候选，因此输出的是限制在候选集合内的条件分布；训练仍使用全词表分母，让正确符号相对所有词表 token 得分更高。候选内概率不会反映模型分给候选之外 token 的总概率。
+
+温度校准只拟合一个正数 $T$，不更新模型参数。$T\gt 1$ 使分布更平缓，$0\lt T\lt 1$ 使分布更尖锐；正温度保持 argmax，但会改变置信度和等级期望分。校准集用于拟合温度，测试集只用于最终评测，二者不能混用。
 
 任务、切分、提示词和决策机制参考 [PyTrio-Jev 章节](https://github.com/datawhalechina/agentic-rl-lab/tree/8493321013c02eef6cf79ca2594811f53c6fdac1/experiments/pytrio-jev)。参考章使用 Qwen3.5-4B，本章默认使用 0.8B，并直接从本地模型取得全部候选 logits；参考服务通过 top-k logprobs 近似候选概率。改编代码与模板的许可证见 [LICENSE.upstream](LICENSE.upstream)。
 
@@ -280,7 +286,7 @@ python experiments/jev/evaluate.py eval --model "$JEV_MODEL" \
 
 - accuracy：字段命中率，score 使用最大概率等级。
 - ECE：以最大候选概率作为置信度，使用 10 个等宽分桶。
-- Brier：每字段对全部候选求 $(p-\mathrm{one\_hot}_{\mathrm{gold}})^2$ 之和，再跨字段平均。
+- Brier：每字段对全部候选求 $(p-\mathrm{onehot}_{\mathrm{gold}})^2$ 之和，再跨字段平均。
 - NLL：正确候选的负对数概率。
 - 五项宏平均准确率：各基准 accuracy 的算术平均。
 

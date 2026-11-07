@@ -4,15 +4,44 @@
 
 本章用 Qwen3.5-4B 作为学生、Qwen3.6-27B 作为冻结教师，在 DeepMath-103K 的数学题目上训练学生 LoRA。训练只读取题目，标准答案用于独立评测。
 
-参考 [General OPD 同步实验](https://github.com/datawhalechina/agentic-rl-lab/tree/238bc688ca7d5c994c580f732ee9c2c92483bd20/experiments/general-opd)。本章对齐参考同步脚本的模型和显式训练参数，使用本地 Transformers、PEFT 和 Lightning Fabric，并增加留出集评测。该配置来自参考教程的实验脚本，不将其视为原论文的完整复现配置。
+### 为什么让学生自己生成
+
+离线蒸馏通常先准备教师答案，再让学生学习这些固定答案。在线蒸馏（on-policy distillation，OPD）每轮都用当前学生生成回答，让教师在学生实际访问的上下文中提供监督。学生更新后会访问新的回答前缀，下一轮也随之重新采样；这就是本章的 on-policy 闭环。
+
+设 $x$ 为题目提示，$y_t$ 为回答的第 $t$ 个 token，$h_t=(x,y_{\lt t})$ 为预测它时的上下文。$\pi_\theta$ 是可训练学生，$\pi_T$ 是冻结教师，$\pi_{\mathrm{old}}$ 是本轮更新前的学生。教师必须对同一上下文中的同一 token 打分，因此两模型使用兼容的词表与 token ID。
+
+### 从 reverse KL 到逐 token 信号
+
+在固定上下文 $h$ 上，学生到教师的 reverse KL 为：
+
+$$
+D_{\mathrm{KL}}(\pi_\theta\parallel\pi_T\mid h)
+=\sum_{v\in V}\pi_\theta(v\mid h)
+\log\frac{\pi_\theta(v\mid h)}{\pi_T(v\mid h)}.
+$$
+
+$V$ 是词表，求和按学生的概率加权。最小化它会惩罚学生相对教师赋予过高概率的 token。本章不存储每个位置的完整教师分布，而是用学生实际采到的 token 估计对数概率差。
+
+固定 $h$ 时，KL 对学生参数的梯度可写为：
+
+$$
+\nabla_\theta D_{\mathrm{KL}}
+=\mathbb{E}_{v\sim\pi_\theta}
+\left[\left(\log\pi_\theta(v\mid h)-\log\pi_T(v\mid h)\right)
+\nabla_\theta\log\pi_\theta(v\mid h)\right].
+$$
+
+求导产生的额外常数项消失，因为 $\sum_v\nabla_\theta\pi_\theta(v\mid h)=0$。这说明可以将负的对数概率差作为固定的 token 优势，通过提高或降低学生 logprob 来实现局部蒸馏更新。
 
 学生先从当前策略采样回答 $y$。教师读取完全相同的 prompt 和回答 token，只打分，不另生成训练答案。在固定的学生轨迹上计算逐 token 信号：
 
 $$
-A_t=\beta\left[\log\pi_T(y_t\mid x,y_{<t})-\log\pi_{\mathrm{old}}(y_t\mid x,y_{<t})\right].
+A_t=\beta\left[\log\pi_T(y_t\mid x,y_{\lt t})-\log\pi_{\mathrm{old}}(y_t\mid x,y_{\lt t})\right].
 $$
 
 教师更偏好的 token 得到正优势；学生过度偏好的 token 得到负优势。它不同于 GRPO 的组内奖励：每个 token 有自己的优势，同题多个回答之间不计算均值或标准差。
+
+### 采样缓存与实际优化目标
 
 令 $\rho_t=\exp(\log\pi_\theta-\log\pi_{\mathrm{old}})$，全局 batch 有 $N$ 个有效回答 token，更新目标为：
 
@@ -20,11 +49,19 @@ $$
 L=-\frac{1}{N}\sum_{i,t}\rho_{i,t}\operatorname{stopgrad}(A_{i,t}).
 $$
 
-本章明确使用有效回答 token 均值，没有 PPO clip。参考脚本只指定服务端 `importance_sampling`，未在该脚本展开归约实现，因此不声称与其数值等价。逐 token 的即时优势遵循参考 demo，不将其描述为完整序列 KL 的无偏策略梯度。
+这里 $\operatorname{stopgrad}$ 表示把优势当作常量，不沿教师或旧策略概率反传。损失只包含回答 token，保留首个 EOS，排除 prompt 和 padding；长回答按有效 token 数贡献更多项。概率比按 token 计算，没有裁剪。
+
+上述梯度解释以已采样前缀为固定上下文。本章每个位置仅使用当前 token 的对数概率差，没有把后续 token 的差值累计成回报，也没有对学生改变前缀分布的影响求完整策略梯度。因此这里优化的是学生访问状态上的局部 token 蒸馏目标，不能直接等同于完整序列 KL 的无偏梯度。
 
 缓存的旧概率和教师概率不求导；当前概率保留梯度。每批只更新一次，更新前概率比数值为 1，但其梯度不为零。每次更新后重新采样。
 
-日志 `reverse_kl` 是学生轨迹上 $\log\pi_{old}-\log\pi_T$ 的 token 平均，可以为负，也不能代替数学正确率。
+例如一个采样 token 的学生概率为 0.2、教师概率为 0.1，则 $A_t=\beta\log(0.1/0.2)\lt 0$，梯度下降会压低学生对它的概率；交换两者概率则得到正优势。无需标准答案奖励，也不把同题多条回答的优势做相对归一化。
+
+日志 `reverse_kl` 是学生轨迹上 $\log\pi_{old}-\log\pi_T$ 的 token 平均。完整分布的 KL 非负，但单个 token 的对数概率差和有限样本均值可以为负。教师偏好也不保证数学正确，因此仍需独立用标准答案评测。
+
+学生通过 LoRA 更新：冻结线性层原权重 $W$，训练低秩增量 $(\alpha/r)BA$，其中 $A,B$ 为可训练矩阵，$r$ 是秩，$\alpha/r$ 是缩放系数。教师始终冻结，只有当前学生的 LoRA 参数接收损失梯度。
+
+参考 [General OPD 同步实验](https://github.com/datawhalechina/agentic-rl-lab/tree/238bc688ca7d5c994c580f732ee9c2c92483bd20/experiments/general-opd)。本章对齐参考同步脚本的模型和显式训练参数，使用本地 Transformers、PEFT 和 Lightning Fabric，并增加留出集评测。该配置来自参考教程的实验脚本，不将其视为原论文的完整复现配置。参考脚本未展开服务端损失归约；本章明确采用上述全局有效 token 均值。
 
 ## 关键算法的代码实现
 

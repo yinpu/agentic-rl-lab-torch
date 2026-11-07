@@ -4,6 +4,18 @@
 
 GRPO 对同一道题采样多个回答，用组内奖励差异估计优势，再通过裁剪概率比更新策略。本章在 GSM8K 上训练 Qwen2.5-0.5B Base，比较正确性奖励、reference KL 和格式奖励的影响。
 
+### 从回答奖励到策略更新
+
+语言模型是一种自回归策略。给定题目 $q$，它逐 token 生成回答 $o=(o_1,\ldots,o_T)$，回答概率为：
+
+$$
+\pi_\theta(o\mid q)=\prod_{t=1}^{T}\pi_\theta(o_t\mid q,o_{\lt t}).
+$$
+
+训练希望提高期望奖励 $J(\theta)=\mathbb{E}_{q\sim\mathcal D,\,o\sim\pi_\theta(\cdot\mid q)}[r(q,o)]$。其中 $\mathcal D$ 是训练题目分布。答案判定本身不可微，但可以用策略梯度：提高高于基线的回答的对数概率，降低低于基线的回答的对数概率。GRPO 用同一道题多个回答的奖励均值估计基线，因此不需要另一个模型预测价值；组内差异提供“这条回答相对其他回答好多少”的信号。
+
+每轮先冻结采样时的策略，得到一批回答及其旧概率，再对同一批 token 重算当前概率并更新参数。回答的奖励和优势在更新期间固定，不对离散采样或答案判定求导。下面依次定义奖励、优势和实际优化的裁剪目标；本章最终采用按回答等权、回答内部按 token 平均的损失。
+
 ### 任务与奖励
 
 训练和评测共用以下提示词，经 tokenizer 的 chat template 编码：
@@ -19,7 +31,7 @@ Problem:
 
 标准答案取 GSM8K `answer` 中 `####` 后的内容。正确性奖励 $c_i$ 提取回答最后一个 `\boxed{...}`，去掉逗号、首尾空白和末尾句点后，与标准答案做字符串比较：相同为 1，否则为 0。
 
-可选格式奖励检查回答是否为一个非空 `<think>...</think>` 块，后面紧跟 boxed 答案。令格式合规标记为 $f_i\in\{0,1\}$，总奖励为：
+可选格式奖励检查回答是否为一个非空 `<think>...</think>` 块，后面紧跟 boxed 答案。令格式合规标记为 $f_i\in\lbrace 0,1\rbrace $，总奖励为：
 
 $$
 r_i=c_i+\lambda f_i.
@@ -44,8 +56,8 @@ $$
 当前策略与采样时旧策略的逐 token 概率比为：
 
 $$
-\rho_{i,t}=\exp\left(\log\pi_\theta(o_{i,t}\mid q,o_{i,<t})
--\log\pi_{\mathrm{old}}(o_{i,t}\mid q,o_{i,<t})\right).
+\rho_{i,t}=\exp\left(\log\pi_\theta(o_{i,t}\mid q,o_{i,\lt t})
+-\log\pi_{\mathrm{old}}(o_{i,t}\mid q,o_{i,\lt t})\right).
 $$
 
 策略损失使用 clipped surrogate，默认 $\epsilon=0.2$：
@@ -57,7 +69,7 @@ $$
 \right).
 $$
 
-正优势提高回答概率，负优势降低回答概率；裁剪限制沿有利方向的过大更新。
+正优势提高回答概率，负优势降低回答概率。正优势且 $\rho\gt 1+\epsilon$ 时，继续增大概率不再改善裁剪目标；负优势且 $\rho\lt 1-\epsilon$ 时，继续减小概率也不再改善它。裁剪作用于目标函数，不是将模型概率直接截断。
 
 可选 KL 约束使用固定基础模型作为 reference：
 
@@ -74,9 +86,15 @@ L=\frac{1}{N}\sum_{i=1}^{N}\frac{1}{T_i}\sum_{t=1}^{T_i}
 \left(\ell^{\mathrm{policy}}_{i,t}+\beta\widehat D_{i,t}\right).
 $$
 
+reference 是固定的初始策略，用来约束训练策略偏离初始模型的程度。上式 $\widehat D$ 是逐 token 的非负 KL 估计项；对当前策略分布取期望时对应当前策略到 reference 的 KL，在复用旧策略采样时作为样本上的正则项计算。
+
+有效回答 token 包含首个 EOS，排除 prompt 和 padding。按回答等权使长回答不会仅因 token 更多而获得更大的总权重。所有生成 token 都共享该回答的标量优势，因此本章不对中间推理步骤单独判分。
+
 KL 直接加入 loss，组内优势只使用奖励 $r_i$。默认 $\beta=0$，可用 `--beta 0.04` 开启 KL 对照。
 
-任务与判分参考 [agentic-rl-lab 的 GRPO 章节](https://github.com/datawhalechina/agentic-rl-lab/tree/8493321013c02eef6cf79ca2594811f53c6fdac1/experiments/grpo)，算法见 [DeepSeekMath](https://arxiv.org/abs/2402.03300)。本章选用 Qwen2.5-0.5B Base、无示例 think + boxed 提示词和 LoRA；优势在参考代码减组内均值的基础上再除以标准差，训练目标采用上述 clipped loss 与按回答等权归约。
+任务与判分参考 [agentic-rl-lab 的 GRPO 章节](https://github.com/datawhalechina/agentic-rl-lab/tree/8493321013c02eef6cf79ca2594811f53c6fdac1/experiments/grpo)，算法出处为 [DeepSeekMath](https://arxiv.org/abs/2402.03300)。本章选用 Qwen2.5-0.5B Base、无示例 think + boxed 提示词和 LoRA；优势在参考代码减组内均值的基础上再除以标准差，训练目标采用上述 clipped loss 与按回答等权归约。
+
+训练只更新 LoRA 参数：对所选线性层，将冻结权重 $W$ 的输出改为 $Wx+(\alpha/r)BAx$，其中 $A,B$ 是可训练的低秩矩阵，$r$ 是秩，$\alpha/r$ 控制增量的缩放。采样和概率计算都使用带有当前 LoRA 的策略；冻结基础权重不改变上述策略梯度目标。
 
 ## 关键算法的代码实现
 
