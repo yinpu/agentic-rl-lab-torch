@@ -1,0 +1,95 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "GRPO：单卡，2题×4回答",
+      // 断点需在编辑器中点击行号左侧添加；下面是位置说明，不会自动设置断点。
+      // 路径均相对于仓库根目录。断点停在该行执行之前，F10 单步，F11 进入函数。
+      // 按训练执行顺序设置：
+      // 1. experiments/grpo/train.py:259 — 采样前：len(local_rows) == 2。
+      // 2. experiments/grpo/train.py:89  — 生成后：len(generated) == 8，同题回答连续排列。
+      // 3. experiments/grpo/train.py:100 — 每题判分后：texts、rewards、advantages 各有 4 项。
+      // 4. experiments/grpo/train.py:261 — rollout 完成：len(samples) == 8；查看 old、reward、advantage。
+      //    samples[:4] 属于第一题，samples[4:] 属于第二题。
+      // 5. experiments/grpo/task.py:273 — 概率比已算出：查看 ratio、advantage、logprobs、old_logprobs。
+      // 6. experiments/grpo/train.py:154 — 当前回答即将反传：查看 weighted_losses；共累积 8 次。
+      // 7. experiments/grpo/train.py:157 — 梯度累积和裁剪完成，即将执行一次 optimizer.step()。
+      // 默认 beta=0；如果所有组的优势都为零，跳过更新，断点 5～7 不会命中。
+      // 如需走通 KL 更新分支，可在 args 中添加 "--beta", "0.04"；仍不保证梯度非零。
+      // 训练前会先评测验证题；eval-every=0 仅关闭中途评测，训练前后评测仍保留。
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "program": "${workspaceFolder}/experiments/grpo/train.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0"
+      },
+      "args": [
+        "--output", "experiments/grpo/runs/${input:grpoDebugRun}",
+        "--train-limit", "2",
+        "--steps", "20",
+        "--batch-size", "2",
+        "--group-size", "4",
+        "--micro-batch-size", "1",
+        "--updates-per-batch", "1",
+        "--max-tokens", "512",
+        "--eval-limit", "2",
+        "--eval-batch-size", "2",
+        "--eval-max-tokens", "128",
+        "--eval-every", "0",
+        "--precision", "bf16"
+      ]
+    },
+    {
+      "name": "JEV：单卡，16案例，2步更新",
+      // 在编辑器中手动添加断点；断点停在该行执行之前。
+      // 1. experiments/jev/train.py:77  — 编码完成：查看 examples 的 input_ids、positions、targets。
+      // 2. experiments/jev/train.py:107 — 即将更新：batch 包含 4 条案例。
+      // 3. experiments/jev/jev.py:256   — 模型前向：查看 ids、mask、selected，单卡每次处理 2 条案例。
+      // 4. experiments/jev/train.py:44  — CE 已算出：查看 values、targets、loss 和全局字段数 count。
+      // 5. experiments/jev/train.py:46  — 即将反传：losses 按全局字段数归一，每次更新累积 2 次反传。
+      // 6. experiments/jev/train.py:48  — 累积完成：查看 norm，即将执行 optimizer.step()。
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "program": "${workspaceFolder}/experiments/jev/train.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0",
+        "HF_HOME": "${workspaceFolder}/.cache/huggingface",
+        "HF_DATASETS_CACHE": "${workspaceFolder}/.cache/datasets"
+      },
+      "args": [
+        "--model", "${workspaceFolder}/.cache/models/Qwen3.5-0.8B",
+        "--data", "${workspaceFolder}/experiments/jev/datasets/train.jsonl",
+        "--output", "experiments/jev/runs/${input:jevDebugRun}",
+        "--max-samples", "16",
+        "--per-device-train-batch-size", "2",
+        "--gradient-accumulation-steps", "2",
+        "--epochs", "1",
+        "--max-steps", "2",
+        "--save-every", "0",
+        "--precision", "bf16"
+      ]
+    }
+  ],
+  "inputs": [
+    {
+      "id": "grpoDebugRun",
+      "type": "promptString",
+      "description": "GRPO 调试输出目录名（位于 experiments/grpo/runs 下，每次使用新名称）",
+      "default": "debug-2x4-001"
+    },
+    {
+      "id": "jevDebugRun",
+      "type": "promptString",
+      "description": "JEV 调试输出目录名（位于 experiments/jev/runs 下，每次使用新名称）",
+      "default": "debug-16-2steps-001"
+    }
+  ]
+}

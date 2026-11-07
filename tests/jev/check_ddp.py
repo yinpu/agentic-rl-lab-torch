@@ -32,8 +32,9 @@ def main():
     model, optimizer = fabric.setup(model, optimizer)
     many = {"input_ids": [1, 2, 3, 4, 5], "positions": [1, 3], "targets": [61, 62]}
     one = {"input_ids": [6, 7, 8, 9], "positions": [2], "targets": [63]}
-    for batch in [[many, one, many, one, many, one], [many, one], [one, many, many, one]]:
-        actual = update(model, optimizer, batch, fabric, micro_batch_size=2)
+    for batch, per_device_batch in [([many, one] * 3, 1), ([many, one], 1),
+                                    ([one, many, many, one], 2), ([many, one] * 4, 2)]:
+        actual = update(model, optimizer, batch, fabric, per_device_train_batch_size=per_device_batch)
         ref_optimizer.zero_grad()
         from experiments.jev.jev import decision_logits
         import torch.nn.functional as F

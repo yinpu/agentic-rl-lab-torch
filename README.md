@@ -13,7 +13,7 @@
 
 GRPO 使用 Transformers、PEFT 和 Lightning Fabric，核心算法直接写在本章代码中。训练与评测共用提示词和答案判定，支持单卡运行与 `torchrun` DDP 启动。
 
-两章均支持 `--micro-batch-size` 调整每进程训练前向的样本数，默认 1；有效 batch 与优化器更新频率由各章原有参数决定。
+GRPO 使用 `--micro-batch-size` 调整每进程训练前向的样本数，默认 1。JEV 使用 `--per-device-train-batch-size`（默认 1）与 `--gradient-accumulation-steps`（默认 16），全局 batch 为单卡 batch × 梯度累积次数 × 卡数。
 
 Jev 使用较小的 Qwen3.5-0.8B，通过 LoRA masked SFT 学习有限候选决策；保留参考章的原任务与数据切分，训练、推理、校准和评测均在本地运行。完整流程见 [第二节教程](experiments/jev/README.md)。
 

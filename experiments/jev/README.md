@@ -80,7 +80,7 @@ $$
 本章先进行监督训练，再对固定 checkpoint 做校准和评测：
 
 1. `Encoder.build_example` 将状态、问题和占位骨架编码为输入 token，输出各字段的预测位置与正确符号 token ID。
-2. `train.py::main` 每轮打乱案例，取完整的全局 batch；`update` 分配各卡案例，再按 micro-batch 前向，计算 marker 位置的全词表交叉熵并累积梯度，最后更新 LoRA。
+2. `train.py::main` 根据单卡 batch、梯度累积次数和卡数计算全局 batch，每轮打乱案例并取完整批次；`update` 分配各卡案例，每次按单卡 batch 前向，计算 marker 位置的全词表交叉熵并累积梯度，最后更新 LoRA。
 3. 训练后比较 checkpoint 的 dev 指标，选定 adapter。
 4. `evaluate.py::calibrate` 在 calibration 案例上收集各字段的候选 logits 和标签，交给 `fit_temperature` 拟合一个温度。
 5. `evaluate.py::evaluate` 用固定 adapter 和温度处理测试案例，经 `candidate_logits`、`build_decisions` 得到决策，再汇总准确率与校准指标。
@@ -92,12 +92,14 @@ examples = [encoder.build_example(r, args.max_length) for r in records]
 ```
 
 ```python
+global_batch_size = (args.per_device_train_batch_size
+                     * args.gradient_accumulation_steps * fabric.world_size)
 for epoch in range(args.epochs):
     random.Random(args.seed + epoch).shuffle(examples)
-    for start in range(0, train_size, args.batch_size):
-        batch = examples[start:start + args.batch_size]
+    for start in range(0, train_size, global_batch_size):
+        batch = examples[start:start + global_batch_size]
         metrics = update(model, optimizer, batch, fabric,
-                         args.max_grad_norm, args.micro_batch_size)
+                         args.max_grad_norm, args.per_device_train_batch_size)
 ```
 
 ### 编码与 marker 定位
@@ -126,7 +128,7 @@ losses.append(loss * fabric.world_size / count)
 fabric.backward(torch.stack(losses).sum())
 ```
 
-DDP 会平均各卡梯度，乘 `world_size / count` 后得到全局字段平均损失。各卡字段数可以不同。每批开始先清空梯度；micro-batch 只拆分前向和反向，`fabric.no_backward_sync` 使梯度只在最后一次反传时同步。所有 micro-batch 累积完，统一处理梯度范数并执行一次 `optimizer.step()`，然后进入下一批。
+DDP 会平均各卡梯度，乘 `world_size / count` 后得到全局字段平均损失。各卡字段数可以不同。每个更新批次开始先清空梯度，各卡每次处理 `per_device_train_batch_size` 条案例，执行 `gradient_accumulation_steps` 次前向和反向。`fabric.no_backward_sync` 使梯度只在最后一次反传时同步。累积完成后，统一处理梯度范数并执行一次 `optimizer.step()`，然后进入下一批。每次反传都按整个更新批次的字段总数归一，保证字段等权。
 
 ### 决策概率与温度拟合
 
@@ -195,7 +197,8 @@ ToolACE 从 `Team-ACE/ToolACE` 提取只调用一个工具的记录；请求文�
 
 ```bash
 python experiments/jev/train.py --model "$JEV_MODEL" \
-  --max-samples 16 --batch-size 4 --micro-batch-size 2 --epochs 1 --max-steps 2 \
+  --max-samples 16 --per-device-train-batch-size 2 --gradient-accumulation-steps 2 \
+  --epochs 1 --max-steps 2 \
   --save-every 0 --output experiments/jev/runs/jev-smoke
 
 python experiments/jev/jev.py --model "$JEV_MODEL" \
@@ -203,25 +206,28 @@ python experiments/jev/jev.py --model "$JEV_MODEL" \
   --input experiments/jev/datasets/dev.jsonl --limit 2
 ```
 
-完整训练默认 2160 条案例、2 个 epoch、全局 batch 16，共 270 次更新：
+全局 batch = 单卡 batch × 梯度累积次数 × 卡数。完整训练在单卡默认配置下使用 2160 条案例、2 个 epoch、单卡 batch 1、累积 16 次，全局 batch 为 16，共 270 次更新：
 
 ```bash
 python experiments/jev/train.py --model "$JEV_MODEL" \
-  --epochs 2 --batch-size 16 --output experiments/jev/runs/jev-full
+  --epochs 2 --per-device-train-batch-size 1 --gradient-accumulation-steps 16 \
+  --output experiments/jev/runs/jev-full
 ```
 
-多卡使用同一脚本，`--batch-size 16` 仍是所有进程合计的案例数：
+多卡使用同一脚本。下面两卡配置将累积次数改为 8，保持全局 batch 为 16：
 
 ```bash
 torchrun --standalone --nproc_per_node=2 experiments/jev/train.py \
-  --model "$JEV_MODEL" --epochs 2 --batch-size 16 --output experiments/jev/runs/jev-ddp
+  --model "$JEV_MODEL" --epochs 2 \
+  --per-device-train-batch-size 1 --gradient-accumulation-steps 8 \
+  --output experiments/jev/runs/jev-ddp
 ```
 
 | 参数 | 默认值与含义 |
 | --- | --- |
 | `--model` | `Qwen/Qwen3.5-0.8B`；接受模型 ID 或本地目录 |
-| `--batch-size` | 16；全局案例数，多卡时须能被进程数整除 |
-| `--micro-batch-size` | 1；每进程一次前向的案例数，不改变有效 batch 和字段权重 |
+| `--per-device-train-batch-size` | 1；每张卡一次前向、反向处理的案例数 |
+| `--gradient-accumulation-steps` | 16；每张卡累积多少次反向传播后更新一次参数；卡数增加而参数不变时，全局 batch 相应增大 |
 | `--epochs` | 2；每轮按 seed+epoch 打乱 |
 | `--learning-rate` | 1e-4；恒定学习率，AdamW，betas=(0.9, 0.999)，eps=1e-8，weight decay=0 |
 | `--lora-rank` / `--lora-alpha` | 32 / 32；文本骨干 all-linear，dropout=0 |
@@ -233,7 +239,7 @@ torchrun --standalone --nproc_per_node=2 experiments/jev/train.py \
 
 训练冻结基础模型，仅更新 LoRA，启用梯度检查点。单卡和多卡都舍弃不足一个全局 batch 的训练尾部，数据至少需要一批。评测和校准使用所选的全部案例。
 
-每次训练使用新的输出目录。产物包括 `train.jsonl`、`tensorboard/` 和 `step-*`、`epoch-*`、`final` 中的 LoRA 权重与 tokenizer；默认输出目录为 `experiments/jev/runs/jev/`。
+每次训练使用新的输出目录。训练配置与指标保存在 `tensorboard/`，`step-*`、`epoch-*`、`final` 中保存 LoRA 权重与 tokenizer；默认输出目录为 `experiments/jev/runs/jev/`。
 
 ### 选优、校准与评测
 

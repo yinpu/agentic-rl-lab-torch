@@ -152,8 +152,8 @@ def test_calibration_identity_is_checked_before_loading(tmp_path, monkeypatch):
         evaluate.main()
 
 
-@pytest.mark.parametrize("micro", [1, 2, 3])
-def test_batch_update_matches_field_mean(micro):
+@pytest.mark.parametrize("per_device_train_batch_size", [1, 2, 4])
+def test_batch_update_matches_field_mean(per_device_train_batch_size):
     from copy import deepcopy
     from lightning.fabric import Fabric
     from transformers import Qwen2Config, Qwen2ForCausalLM
@@ -165,10 +165,11 @@ def test_batch_update_matches_field_mean(micro):
     reference = deepcopy(model)
     examples = [{"input_ids": [1, 2, 3, 4, 5], "positions": [1, 3], "targets": [61, 62]},
                 {"input_ids": [6, 7, 8], "positions": [1], "targets": [63]},
-                {"input_ids": [9, 10, 11, 12], "positions": [0, 2], "targets": [64, 65]}]
+                {"input_ids": [9, 10, 11, 12], "positions": [0, 2], "targets": [64, 65]},
+                {"input_ids": [13, 14, 15], "positions": [1], "targets": [66]}]
     for actual, e in zip(batch_decision_logits(model, examples, "cpu"), examples, strict=True):
         torch.testing.assert_close(actual, decision_logits(reference, e, "cpu"))
-    expected_loss = sum(F.cross_entropy(decision_logits(reference, e, "cpu"), torch.tensor(e["targets"]), reduction="sum") for e in examples) / 5
+    expected_loss = sum(F.cross_entropy(decision_logits(reference, e, "cpu"), torch.tensor(e["targets"]), reduction="sum") for e in examples) / 6
     expected_loss.backward()
     ref_opt = torch.optim.SGD(reference.parameters(), lr=.1)
     ref_opt.step()
@@ -176,23 +177,36 @@ def test_batch_update_matches_field_mean(micro):
     fabric.launch()
     optimizer = torch.optim.SGD(model.parameters(), lr=.1)
     model, optimizer = fabric.setup(model, optimizer)
-    metrics = update(model, optimizer, examples, fabric, micro_batch_size=micro)
+    metrics = update(model, optimizer, examples, fabric,
+                     per_device_train_batch_size=per_device_train_batch_size)
     assert metrics["loss"] == pytest.approx(expected_loss.item(), abs=1e-6)
     for p, q in zip(model.parameters(), reference.parameters(), strict=True):
         torch.testing.assert_close(p.grad, q.grad, atol=1e-6, rtol=1e-5)
         torch.testing.assert_close(p, q, atol=1e-6, rtol=1e-5)
 
 
-@pytest.mark.parametrize("count,batch_size,world_size,expected", [
-    (7, 4, 1, 4), (7, 4, 2, 4), (8, 4, 2, 8),
+@pytest.mark.parametrize("count,per_device_batch,accumulation,world_size,expected", [
+    (7, 2, 2, 1, 4), (7, 1, 2, 2, 4), (8, 2, 2, 2, 8),
+    (15, 2, 2, 2, 8), (16, 2, 2, 2, 16),
 ])
-def test_training_size_uses_complete_batches(count, batch_size, world_size, expected):
+def test_training_size_uses_complete_batches(count, per_device_batch, accumulation, world_size, expected):
     from experiments.jev.train import training_size
-    assert training_size(count, batch_size, world_size) == expected
+    global_batch_size = per_device_batch * accumulation * world_size
+    assert training_size(count, global_batch_size) == expected
 
 
-@pytest.mark.parametrize("count,batch_size,world_size", [(3, 4, 1), (3, 4, 2), (7, 3, 2), (0, 4, 1)])
-def test_training_size_rejects_unusable_batches(count, batch_size, world_size):
+@pytest.mark.parametrize("count,global_batch_size", [(3, 4), (7, 8), (0, 4)])
+def test_training_size_rejects_unusable_batches(count, global_batch_size):
     from experiments.jev.train import training_size
     with pytest.raises(ValueError):
-        training_size(count, batch_size, world_size)
+        training_size(count, global_batch_size)
+
+
+@pytest.mark.parametrize("option", ["--per-device-train-batch-size", "--gradient-accumulation-steps"])
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_batch_arguments_must_be_positive(monkeypatch, option, value):
+    from experiments.jev.train import parse_args
+    monkeypatch.setattr(sys, "argv", ["train.py", option, value])
+    with pytest.raises(SystemExit) as error:
+        parse_args()
+    assert error.value.code == 2

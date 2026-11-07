@@ -1,7 +1,6 @@
 """LoRA masked SFT。一个全局 batch 内按案例累积，按决策字段数归一。"""
 import argparse
 import os
-import json
 from pathlib import Path
 import random
 import sys
@@ -20,25 +19,23 @@ if __package__ in (None, ""):
 from .jev import DEFAULT_MODEL, Encoder, batch_decision_logits, load_jsonl, load_model
 
 
-def training_size(count, batch_size, world_size):
+def training_size(count, global_batch_size):
     """只处理完整全局 batch；多卡时每卡分到相同数量的样本。"""
-    if world_size > 1 and batch_size % world_size:
-        raise ValueError("global batch size must be divisible by world size")
-    size = count // batch_size * batch_size
+    size = count // global_batch_size * global_batch_size
     if size == 0:
         raise ValueError("not enough training data for one batch; reduce batch size or add data")
     return size
 
 
-def update(model, optimizer, examples, fabric, max_grad_norm=0.0, micro_batch_size=1):
-    """按全局字段数归一；micro-batch 只改变并行计算，不改变更新目标。"""
+def update(model, optimizer, examples, fabric, max_grad_norm=0.0, per_device_train_batch_size=1):
+    """每卡按指定案例数前向并累积梯度，按整个更新批次的字段总数归一。"""
     count = sum(len(e["targets"]) for e in examples)
     local = examples[fabric.global_rank::fabric.world_size]
     loss_sum = torch.zeros((), device=fabric.device)
     optimizer.zero_grad()
-    for start in range(0, len(local), micro_batch_size):
-        chunk = local[start:start + micro_batch_size]
-        with fabric.no_backward_sync(model, enabled=start + micro_batch_size < len(local)):
+    for start in range(0, len(local), per_device_train_batch_size):
+        chunk = local[start:start + per_device_train_batch_size]
+        with fabric.no_backward_sync(model, enabled=start + per_device_train_batch_size < len(local)):
             logits = batch_decision_logits(model, chunk, fabric.device)
             losses = []
             for example, values in zip(chunk, logits, strict=True):
@@ -71,7 +68,9 @@ def main(args):
         records = records[:args.max_samples]
     if not records:
         raise ValueError("empty training set")
-    train_size = training_size(len(records), args.batch_size, fabric.world_size)
+    global_batch_size = (args.per_device_train_batch_size * args.gradient_accumulation_steps
+                         * fabric.world_size)
+    train_size = training_size(len(records), global_batch_size)
     model, tokenizer = load_model(args.model, args.precision)
     encoder = Encoder(tokenizer)
     examples = [encoder.build_example(r, args.max_length) for r in records]
@@ -87,7 +86,7 @@ def main(args):
         args.output.mkdir(parents=True, exist_ok=True)
         fabric.logger.log_hyperparams({
             key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()
-        } | {"world_size": fabric.world_size})
+        } | {"world_size": fabric.world_size, "global_batch_size": global_batch_size})
     fabric.barrier()
 
     def save(name):
@@ -103,17 +102,16 @@ def main(args):
     for epoch in range(args.epochs):
         # 与参考脚本一致：在上个 epoch 顺序上再次 shuffle。
         random.Random(args.seed + epoch).shuffle(examples)
-        for start in range(0, train_size, args.batch_size):
-            batch = examples[start:start + args.batch_size]
-            metrics = update(model, optimizer, batch, fabric, args.max_grad_norm, args.micro_batch_size)
+        for start in range(0, train_size, global_batch_size):
+            batch = examples[start:start + global_batch_size]
+            metrics = update(model, optimizer, batch, fabric, args.max_grad_norm,
+                             args.per_device_train_batch_size)
             step += 1
             if fabric.is_global_zero:
-                metrics.update(step=step, epoch=epoch + 1, records=len(batch))
-                with (args.output / "train.jsonl").open("a") as f:
-                    f.write(json.dumps(metrics) + "\n")
-                fabric.log_dict({f"train/{k}": v for k, v in metrics.items() if k != "step"}
-                                | {"train/learning_rate": optimizer.param_groups[0]["lr"]}, step=step)
-                print(json.dumps(metrics), flush=True)
+                metrics.update(epoch=epoch + 1, records=len(batch),
+                               learning_rate=optimizer.param_groups[0]["lr"])
+                fabric.log_dict({f"train/{k}": v for k, v in metrics.items()}, step=step)
+                fabric.print({"step": step, **metrics}, flush=True)
             if args.save_every and step % args.save_every == 0:
                 save(f"step-{step}")
             if args.max_steps and step >= args.max_steps:
@@ -132,8 +130,10 @@ def parse_args():
     parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parent / "runs/jev")
     parser.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")
     parser.add_argument("--epochs", type=int, default=2)
-    parser.add_argument("--micro-batch-size", type=int, default=1, help="每进程一次训练前向的样本数；不改变有效 batch")
-    parser.add_argument("--batch-size", type=int, default=16, help="全局案例数；各卡按 micro-batch 累积")
+    parser.add_argument("--per-device-train-batch-size", type=int, default=1,
+                        help="每张卡一次前向、反向处理的案例数")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=16,
+                        help="每张卡累积多少次反向传播后更新参数；全局 batch = 单卡 batch × 累积次数 × 卡数")
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--lora-rank", type=int, default=32)
     parser.add_argument("--lora-alpha", type=int, default=32)
@@ -144,7 +144,7 @@ def parse_args():
     parser.add_argument("--save-every", type=int, default=60)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
-    for key in ("micro_batch_size", "epochs", "batch_size", "lora_rank", "lora_alpha"):
+    for key in ("per_device_train_batch_size", "gradient_accumulation_steps", "epochs", "lora_rank", "lora_alpha"):
         if getattr(args, key) <= 0:
             parser.error(f"--{key.replace('_', '-')} must be positive")
     for key in ("max_samples", "max_steps", "save_every", "max_length", "max_grad_norm"):
