@@ -21,9 +21,9 @@ Problem:
 
 可选格式奖励检查回答是否为一个非空 `<think>...</think>` 块，后面紧跟 boxed 答案。令格式合规标记为 $f_i\in\{0,1\}$，总奖励为：
 
-\[
+$$
 r_i=c_i+\lambda f_i.
-\]
+$$
 
 默认 $\lambda=0$；设置 `--format-reward-weight 0.5` 时，格式合规额外得 0.5 分。正确性和格式分别打分，独立评测的 accuracy 只使用正确性。
 
@@ -31,11 +31,11 @@ r_i=c_i+\lambda f_i.
 
 对题目 $q$，旧策略采样 $G$ 个回答，奖励为 $r_1,\ldots,r_G$：
 
-\[
+$$
 \bar r=\frac{1}{G}\sum_{j=1}^{G}r_j,
 \qquad
 A_i=\frac{r_i-\bar r}{\operatorname{std}(r_1,\ldots,r_G)+10^{-8}}.
-\]
+$$
 
 组内均值充当 baseline，无需训练 critic。这里使用总体标准差，同一回答的所有有效 token 共用 $A_i$。例如奖励 `[1, 0, 1, 0]` 得到优势约 `[1, -1, 1, -1]`；奖励全相同时，优势为零。
 
@@ -43,36 +43,36 @@ A_i=\frac{r_i-\bar r}{\operatorname{std}(r_1,\ldots,r_G)+10^{-8}}.
 
 当前策略与采样时旧策略的逐 token 概率比为：
 
-\[
+$$
 \rho_{i,t}=\exp\left(\log\pi_\theta(o_{i,t}\mid q,o_{i,<t})
 -\log\pi_{\mathrm{old}}(o_{i,t}\mid q,o_{i,<t})\right).
-\]
+$$
 
 策略损失使用 clipped surrogate，默认 $\epsilon=0.2$：
 
-\[
+$$
 \ell^{\mathrm{policy}}_{i,t}=-\min\left(
 \rho_{i,t}A_i,
 \operatorname{clip}(\rho_{i,t},1-\epsilon,1+\epsilon)A_i
 \right).
-\]
+$$
 
 正优势提高回答概率，负优势降低回答概率；裁剪限制沿有利方向的过大更新。
 
 可选 KL 约束使用固定基础模型作为 reference：
 
-\[
+$$
 \Delta_{i,t}=\log\pi_{\mathrm{ref}}-\log\pi_\theta,
 \qquad
 \widehat D_{i,t}=e^{\Delta_{i,t}}-\Delta_{i,t}-1.
-\]
+$$
 
 先平均每条回答的有效 token，再对全部 $N$ 条回答等权平均：
 
-\[
+$$
 L=\frac{1}{N}\sum_{i=1}^{N}\frac{1}{T_i}\sum_{t=1}^{T_i}
 \left(\ell^{\mathrm{policy}}_{i,t}+\beta\widehat D_{i,t}\right).
-\]
+$$
 
 KL 直接加入 loss，组内优势只使用奖励 $r_i$。默认 $\beta=0$，可用 `--beta 0.04` 开启 KL 对照。
 

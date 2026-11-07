@@ -41,11 +41,11 @@ system 提示词要求用符号作答，user 提示词包含状态和决策 sche
 
 设第 $f$ 个字段的 marker 下标为 $m_f$，正确候选符号为 $y_f$。因果语言模型使用位置 $m_f-1$ 的 logits 预测它：
 
-\[
+$$
 \ell_f=-\log\frac{\exp z_{m_f-1,y_f}}{\sum_{v\in V}\exp z_{m_f-1,v}},
 \qquad
 L=\frac{1}{\sum_i|F_i|}\sum_i\sum_{f\in F_i}\ell_{i,f}.
-\]
+$$
 
 训练 softmax 的分母覆盖完整词表，只在 marker 的预测位置计算监督损失。全局 batch 内每个字段等权，因此五字段案例贡献五项损失，单字段案例贡献一项。
 
@@ -53,9 +53,9 @@ L=\frac{1}{\sum_i|F_i|}\sum_i\sum_{f\in F_i}\ell_{i,f}.
 
 推理使用同一骨架，一次前向提取所有字段的候选 logits。对于候选集合 $C_f$ 和温度 $T>0$：
 
-\[
+$$
 p_f(c;T)=\frac{\exp(z_{m_f-1,c}/T)}{\sum_{c'\in C_f}\exp(z_{m_f-1,c'}/T)}.
-\]
+$$
 
 | 题型 | 输出 |
 | --- | --- |
@@ -65,9 +65,9 @@ p_f(c;T)=\frac{\exp(z_{m_f-1,c}/T)}{\sum_{c'\in C_f}\exp(z_{m_f-1,c'}/T)}.
 
 温度校准在 calibration 划分上最小化字段平均 NLL：
 
-\[
+$$
 T^*=\arg\min_{T>0}\frac{1}{M}\sum_{f=1}^{M}-\log p_f(y_f;T).
-\]
+$$
 
 正温度保持 argmax，调整预测置信度。
 
