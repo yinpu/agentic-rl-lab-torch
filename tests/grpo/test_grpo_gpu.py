@@ -73,7 +73,7 @@ def test_qwen_gpu_reward_update_and_reload(beta, weight, monkeypatch, tmp_path):
              f"{reasoning}\n\\boxed{{{wrong_answer}}}"]
     completions = [(tokenizer.encode(text, add_special_tokens=False) + [eos_ids(tokenizer)[0]], False)
                    for text in texts]
-    args = SimpleNamespace(max_tokens=1024, group_size=4, standardize_advantages=False,
+    args = SimpleNamespace(max_tokens=1024, group_size=4,
                            beta=beta, format_reward_weight=weight, clip=0.2, max_grad_norm=1., micro_batch_size=2)
     # 只替换检查输入，仍执行生产代码 rollout 的奖励、优势和旧/参考概率计算。
     with monkeypatch.context() as patch, fabric.autocast():
@@ -82,8 +82,11 @@ def test_qwen_gpu_reward_update_and_reload(beta, weight, monkeypatch, tmp_path):
     assert [s["correct"] for s in samples] == [1., 1., 0., 0.]
     assert [s["format_reward"] for s in samples] == [weight, 0., weight, 0.]
     assert [s["reward"] for s in samples] == [1. + weight, 1., weight, 0.]
-    assert [s["advantage"] for s in samples] == [0.5 + weight / 2, 0.5 - weight / 2,
-                                                -0.5 + weight / 2, -0.5 - weight / 2]
+    # 四种奖励组合的总体方差为 (1 + weight**2) / 4。
+    std = ((1 + weight**2) / 4)**0.5
+    expected_advantages = [(0.5 + weight / 2) / std, (0.5 - weight / 2) / std,
+                           (-0.5 + weight / 2) / std, (-0.5 - weight / 2) / std]
+    assert [s["advantage"] for s in samples] == pytest.approx(expected_advantages)
     old_copies = [s["old"].clone() for s in samples]
     for sample in samples:
         assert sample["old"].shape == (len(sample["tokens"]),)

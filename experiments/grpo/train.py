@@ -36,7 +36,6 @@ def parse_args():
     parser.add_argument("--group-size", type=int, default=8, help="同一道题的回答数，至少为 2")
     parser.add_argument("--max-tokens", type=int, default=1024)  # 每条回答的新增 token 上限。
     parser.add_argument("--updates-per-batch", type=int, default=1, help="固定本批旧 logprob，重复优化次数")
-    parser.add_argument("--standardize-advantages", action="store_true", help="额外除以组内总体标准差；默认仅减均值")
     parser.add_argument("--beta", type=float, default=0.0, help="reference KL 系数；0 不计算 KL")
     parser.add_argument("--format-reward-weight", type=float, default=0.0,
                         help="格式奖励权重 λ：总奖励=正确性+λ×格式合规；0 关闭，实验可取 0.5")
@@ -73,7 +72,7 @@ def rollout(model, tokenizer, rows, args):
     """用更新前的策略采样、判分，返回本进程的回答记录列表 samples。
 
     model 是解开 DDP 包装的 LoRA 模型；rows 为含 index/question/answer 的题目列表。
-    args 使用 max_tokens、group_size、standardize_advantages、beta 和 format_reward_weight。
+    args 使用 max_tokens、group_size、beta 和 format_reward_weight。
     B 道题返回 B*G 条记录，同题的 G 条回答连续排列。关键字段：
       prompt/tokens：提示词/回答 ID 列表，长度分别为 P/T；
       old/reference：冻结的逐 token logprob，CPU 张量 [T]，reference 可为 None；
@@ -95,7 +94,7 @@ def rollout(model, tokenizer, rows, args):
         # KL 不加进 R_i，而是由 grpo_loss 直接加到 loss。
         rewards = [score["reward"] for score in scores]
         # 每一道题单独构成一组；不能把不同题目的奖励混在一起计算均值。
-        advantages = group_advantages(rewards, args.standardize_advantages)
+        advantages = group_advantages(rewards)
         for (tokens, truncated), text, score, advantage in zip(completions, texts, scores, advantages, strict=True):
             with torch.no_grad():
                 # πold 只在采样阶段计算一次，多次 update 时也不重算。

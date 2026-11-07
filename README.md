@@ -34,4 +34,9 @@ cd agentic-rl-lab-torch
 .venv/bin/python -m pytest -q
 ```
 
-真实模型 GPU 检查需要 CUDA 和本地缓存权重，否则自动跳过。两进程 CPU DDP 检查需单独运行，命令见各章教程。
+真实模型 GPU 检查需要 CUDA 和本地缓存权重，否则自动跳过。两进程 CPU DDP 检查单独运行：
+
+```bash
+.venv/bin/torchrun --standalone --nproc_per_node=2 tests/grpo/check_ddp.py
+.venv/bin/torchrun --standalone --nproc_per_node=2 tests/jev/check_ddp.py
+```

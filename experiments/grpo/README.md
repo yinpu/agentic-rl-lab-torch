@@ -1,34 +1,12 @@
-# GRPO：从公式到 GSM8K 上的 LoRA 训练
+# GRPO：GSM8K 上的 LoRA 强化学习
 
-这一章研究一个具体问题：给模型同一道数学题的多个回答打分，能否改善它在未参与训练的题目上的表现？先使用最终答案正确性奖励，再分别对照加入 KL 约束和格式奖励的影响。
+## 算法原理
 
-任务与判分规则参考 [agentic-rl-lab 的 GRPO 章节](https://github.com/datawhalechina/agentic-rl-lab/tree/8493321013c02eef6cf79ca2594811f53c6fdac1/experiments/grpo)。本章使用 Qwen2.5-0.5B Base 和无示例的 think + boxed 提示词。Transformers 加载和生成，PEFT 管理 LoRA，Fabric 处理设备和 DDP；优势、概率比、clip、KL 和更新循环都直接放在本章代码里。
+GRPO 对同一道题采样多个回答，用组内奖励差异估计优势，再通过裁剪概率比更新策略。本章在 GSM8K 上训练 Qwen2.5-0.5B Base，比较正确性奖励、reference KL 和格式奖励的影响。
 
-从项目根目录执行下文命令。文件之间的关系是：
+### 任务与奖励
 
-- `task.py`：提示词、奖励、数据划分、模型加载和 GRPO 公式。
-- `train.py`：采样、缓存旧概率、按 micro-batch 反向传播、评测与保存。
-- `evaluate.py`：用同一任务定义独立评测基础模型或保存的 LoRA。
-
-## 先沿公式阅读代码
-
-本章只维护一套训练实现。下面引用的代码都来自实际参与训练的函数，可以直接修改这些函数开展实验。
-
-| 阅读顺序 | 数学量或操作 | 实际代码 |
-| --- | --- | --- |
-| 1. 给回答打分 | $r_i$ | [task.py](task.py) 的 `training_rewards` |
-| 2. 同题回答相互比较 | $A_i$ | [task.py](task.py) 的 `group_advantages` |
-| 3. 取得回答 token 的概率 | $\log\pi$ | [task.py](task.py) 的 `completion_logprobs` |
-| 4. 计算概率比、裁剪和可选 KL | $\rho$、$\ell_{i,t}$ | [task.py](task.py) 的 `grpo_loss` |
-| 5. 累积梯度并更新 LoRA | $\nabla_\theta L$ | [train.py](train.py) 的 `update_policy` |
-
-`train.py::rollout` 串起采样、奖励、优势与旧概率缓存；`main` 串起采样、更新和评测。可以先读下面的算法主线，再看后面的环境、运行与工程说明。
-
-## 从一道题开始
-
-GSM8K 的每条数据包含 `question` 和带解题过程的 `answer`，标准答案在 `####` 后。训练只把 question 交给模型，不把标准解答放进 prompt。
-
-训练与评测都调用 `task.py::prompt_ids`，使用同一份固定指令。只发送一个包含当前题目的 user 消息，没有示范解答：
+训练和评测共用以下提示词，经 tokenizer 的 chat template 编码：
 
 ```text
 Solve the following math problem.
@@ -39,23 +17,125 @@ Problem:
 {question}
 ```
 
-使用该 tokenizer 自带的 chat template；它会自动添加默认的 system 文本与 assistant 起始标记。没有手工预填 `<think>`，也没有给出答案或解题过程。对 Qwen2.5 Base，标签是输出协议，不是原生 thinking 开关；需要实际检查模型能否遵循。
+标准答案取 GSM8K `answer` 中 `####` 后的内容。正确性奖励 $c_i$ 提取回答最后一个 `\boxed{...}`，去掉逗号、首尾空白和末尾句点后，与标准答案做字符串比较：相同为 1，否则为 0。
 
-正确性奖励取回答最后一个 `\boxed{...}`，去掉逗号、首尾空白、末尾句点，与标准答案比较：正确为 1，否则为 0。不做数学等价判断，例如 `1000.0` 与 `1000` 仍可能判成不同答案。即使没有 think 标签，只要 boxed 答案正确，正确性奖励仍为 1。默认不加格式奖励。
-
-`think_format_rate` 监控严格格式：一个非空 `<think>...</think>` 块，后面紧跟 boxed 答案，允许首尾空白。标签正确不代表答案正确。训练可通过 `--format-reward-weight` 给格式合规额外加分，独立评测的 accuracy 始终只按正确性判定。
-
-该格式借鉴 [DeepSeek-R1-Zero 的训练模板](https://arxiv.org/html/2501.12948v1#S2.SS2)，但最终答案保留 boxed 判分，而非其模板的 answer 标签。本章的格式判定和奖励权重是本地实验选择，属于简化 GRPO 实验，不宣称完整复现 R1-Zero。
-
-## 可选格式奖励
-
-`task.py::training_rewards` 将奖励分项写在一起。令正确性为 $c_i\in\{0,1\}$，严格格式合规为 $f_i\in\{0,1\}$：
+可选格式奖励检查回答是否为一个非空 `<think>...</think>` 块，后面紧跟 boxed 答案。令格式合规标记为 $f_i\in\{0,1\}$，总奖励为：
 
 \[
 r_i=c_i+\lambda f_i.
 \]
 
-对应 `training_rewards` 中实际执行的计算：
+默认 $\lambda=0$；设置 `--format-reward-weight 0.5` 时，格式合规额外得 0.5 分。正确性和格式分别打分，独立评测的 accuracy 只使用正确性。
+
+### 组内优势
+
+对题目 $q$，旧策略采样 $G$ 个回答，奖励为 $r_1,\ldots,r_G$：
+
+\[
+\bar r=\frac{1}{G}\sum_{j=1}^{G}r_j,
+\qquad
+A_i=\frac{r_i-\bar r}{\operatorname{std}(r_1,\ldots,r_G)+10^{-8}}.
+\]
+
+组内均值充当 baseline，无需训练 critic。这里使用总体标准差，同一回答的所有有效 token 共用 $A_i$。例如奖励 `[1, 0, 1, 0]` 得到优势约 `[1, -1, 1, -1]`；奖励全相同时，优势为零。
+
+### 裁剪目标与 KL
+
+当前策略与采样时旧策略的逐 token 概率比为：
+
+\[
+\rho_{i,t}=\exp\left(\log\pi_\theta(o_{i,t}\mid q,o_{i,<t})
+-\log\pi_{\mathrm{old}}(o_{i,t}\mid q,o_{i,<t})\right).
+\]
+
+策略损失使用 clipped surrogate，默认 $\epsilon=0.2$：
+
+\[
+\ell^{\mathrm{policy}}_{i,t}=-\min\left(
+\rho_{i,t}A_i,
+\operatorname{clip}(\rho_{i,t},1-\epsilon,1+\epsilon)A_i
+\right).
+\]
+
+正优势提高回答概率，负优势降低回答概率；裁剪限制沿有利方向的过大更新。
+
+可选 KL 约束使用固定基础模型作为 reference：
+
+\[
+\Delta_{i,t}=\log\pi_{\mathrm{ref}}-\log\pi_\theta,
+\qquad
+\widehat D_{i,t}=e^{\Delta_{i,t}}-\Delta_{i,t}-1.
+\]
+
+先平均每条回答的有效 token，再对全部 $N$ 条回答等权平均：
+
+\[
+L=\frac{1}{N}\sum_{i=1}^{N}\frac{1}{T_i}\sum_{t=1}^{T_i}
+\left(\ell^{\mathrm{policy}}_{i,t}+\beta\widehat D_{i,t}\right).
+\]
+
+KL 直接加入 loss，组内优势只使用奖励 $r_i$。默认 $\beta=0$，可用 `--beta 0.04` 开启 KL 对照。
+
+任务与判分参考 [agentic-rl-lab 的 GRPO 章节](https://github.com/datawhalechina/agentic-rl-lab/tree/8493321013c02eef6cf79ca2594811f53c6fdac1/experiments/grpo)，算法见 [DeepSeekMath](https://arxiv.org/abs/2402.03300)。本章选用 Qwen2.5-0.5B Base、无示例 think + boxed 提示词和 LoRA；优势在参考代码减组内均值的基础上再除以标准差，训练目标采用上述 clipped loss 与按回答等权归约。
+
+## 关键算法的代码实现
+
+### 一批数据的训练流程
+
+[train.py](train.py) 的 `main` 按以下顺序处理每个全局采样批次：
+
+1. 取出一批题目，分配给各进程；同一道题的全部回答在同一进程采样。
+2. `rollout` 用更新前的策略为每题生成 $G$ 个回答，计算奖励、组内优势，并缓存旧策略和可选 reference 的逐 token logprob。
+3. `should_update` 汇总全局优势信号，决定本批是否更新。
+4. `update_policy` 对这些回答重新计算当前策略 logprob，计算 clipped loss 和可选 KL，累积梯度并更新 LoRA。
+5. 同批可重复更新 `updates_per_batch` 次，随后用更新后的策略采样下一批；按 `eval_every` 定期评测。
+
+主循环的核心调用为：
+
+```python
+batch = train_rows[start:start + global_batch_size]
+local_rows = batch[fabric.global_rank::fabric.world_size]
+with fabric.autocast():
+    samples = rollout(raw_model, tokenizer, local_rows, args)
+if should_update(samples, args.beta, fabric):
+    for update in range(args.updates_per_batch):
+        metrics = update_policy(model, optimizer, samples, args, fabric)
+```
+
+### Rollout：从题目到训练样本
+
+`rollout` 的输入是本进程的题目列表 `rows`，输出是回答记录列表 `samples`。若本进程有 $B$ 道题，输出就有 $B\times G$ 条记录。每道题先编码为 prompt，再一次生成该题的 $G$ 个回答：
+
+```python
+prompt = prompt_ids(tokenizer, row["question"])
+completions = generate(model, tokenizer, prompt, args.max_tokens, args.group_size)
+texts = [tokenizer.decode(tokens, skip_special_tokens=True) for tokens, _ in completions]
+scores = [training_rewards(text, ground_truth(row["answer"]), args.format_reward_weight)
+          for text in texts]
+rewards = [score["reward"] for score in scores]
+advantages = group_advantages(rewards)
+```
+
+`generate` 返回每条回答的 token ID 和截断标记；解码文本用于判分，原始 token ID 留给后续概率计算。同题的奖励单独标准化为优势。采样设置为 temperature=1、top-p=1、top-k=0、repetition penalty=1，模型和 LoRA 的 dropout 均为 0。
+
+随后遍历该题回答，在无梯度上下文中缓存概率：
+
+```python
+with torch.no_grad():
+    old = completion_logprobs(model, prompt, tokens).cpu()
+    reference = None
+    if args.beta:
+        with model.disable_adapter():
+            reference = completion_logprobs(model, prompt, tokens).cpu()
+```
+
+每条记录保存 `prompt`、`tokens`、`reward`、`advantage`、`old` 和 `reference`，以及回答文本和截断标记。`old` 与 `reference` 是长度等于有效回答 token 数的向量，`advantage` 是该回答的标量。
+
+整批 rollout 结束后才开始更新，所以这些 `old` 都来自同一个采样策略。同批重复更新始终复用这份记录；当前策略概率在每次更新时重算，下一批 rollout 才刷新旧概率。reference 来自关闭 LoRA 的冻结基础模型，整个训练过程中固定。
+
+### 奖励与优势
+
+[task.py](task.py) 的 `training_rewards` 在 rollout 判分时组合两项奖励：
 
 ```python
 correct = reward(text, answer)
@@ -63,70 +143,16 @@ think_format = follows_think_format(text)
 format_reward = format_reward_weight * float(think_format)
 ```
 
-返回记录中的 `reward` 为 `correct + format_reward`，供组内优势计算使用。
-
-`--format-reward-weight 0` 对应当前基线；设为 `0.5` 时，格式合规额外得 0.5 分，总奖励范围为 0 到 1.5。这是对照实验的起始权重，效果需要通过完整训练比较。
-
-| 输出情况 | 正确性 $c_i$ | 格式 $f_i$ | 总奖励（λ=0.5） |
-| --- | ---: | ---: | ---: |
-| 答案正确、格式合规 | 1 | 1 | 1.5 |
-| 答案正确、格式不合规 | 1 | 0 | 1 |
-| 答案错误、格式合规 | 0 | 1 | 0.5 |
-| 答案错误、格式不合规 | 0 | 0 | 0 |
-
-格式奖励只检查输出结构，不判断推理质量，也不以答案正确为前提。先把两项相加，再用总奖励计算组内优势；KL 仍独立加入 loss。例如同组两条答案都错，只有第一条格式合规，总奖励为 `[0.5, 0]`，仅减均值的优势为 `[0.25, -0.25]`。
-
-若同组所有回答都不合规，格式奖励全为 0，就没有额外的格式学习信号；应查看实际 rollout 和格式率，不能仅根据开启了奖励推断训练有效。
-
-## 不训练 critic：用同题回答建立 baseline
-
-对题目 $q$，用当前策略生成 $G$ 个回答 $o_1,\ldots,o_G$，奖励为 $r_i$。默认与参考代码一致，只减去本组均值：
-
-\[
-\bar r=\frac{1}{G}\sum_{j=1}^{G}r_j,
-\qquad A_i=r_i-\bar r.
-\]
-
-在 `task.py::group_advantages` 中就是：
+返回的 `reward` 为 `correct + format_reward`。`group_advantages` 对同一道题的奖励执行：
 
 ```python
-advantages = rewards - rewards.mean()
+rewards = torch.tensor(rewards, dtype=torch.float32)
+return (rewards - rewards.mean()) / (rewards.std(correction=0) + 1e-8)
 ```
 
-例如 `[1, 0, 1, 0]` 得到 `[0.5, -0.5, 0.5, -0.5]`。同一回答的每个有效 token 共用一个 $A_i$。不额外训练 value model。
+### 回答 token 的概率对齐
 
-论文常见的组内标准化形式为：
-
-\[
-A_i=\frac{r_i-\bar r}{\operatorname{std}(r_1,\ldots,r_G)+10^{-8}}.
-\]
-
-`group_advantages` 中的可选分支为：
-
-```python
-if standardize:
-    advantages = advantages / (rewards.std(correction=0) + 1e-8)
-```
-
-用 `--standardize-advantages` 启用，代码采用总体标准差 `correction=0`，上例得到 `[1, -1, 1, -1]`。这是显式算法选择，不是依赖训练库默认值。所有奖励相同时，两种方式都得到零优势。
-
-## 采样后，固定旧策略的概率
-
-一个采样批次先完成所有题目的 rollout，再开始更新。`train.py::rollout` 保存每条回答的 token、reward、advantage 和无梯度的旧 logprob。旧概率在本批的所有更新中保持不变。
-
-训练采样固定 temperature=1、top-p=1、top-k=0、repetition penalty=1。新建 `GenerationConfig`，避免模型仓库默认配置改变采样分布。模型与 LoRA 的 dropout 均为 0；采样、概率计算和独立评测均使用相同精度的 autocast。
-
-`rollout` 在无梯度上下文中缓存旧概率：
-
-```python
-old = completion_logprobs(model, prompt, tokens).cpu()
-```
-
-这里的 old policy 是本批采样时的策略。它与后文的固定 reference 不同。
-
-## 逐 token logprob 如何对齐
-
-假设 prompt 是 `[p0, p1, p2]`，completion 是 `[c0, c1, EOS]`。自回归模型使用：
+`task.py::completion_logprobs` 复用批量函数 `batch_completion_logprobs`。模型输入是 `prompt + completion[:-1]`，预测目标是 completion：
 
 ```text
 输入：p0 p1 p2 c0 c1
@@ -134,49 +160,21 @@ old = completion_logprobs(model, prompt, tokens).cpu()
 目标：      c0 c1 EOS
 ```
 
-`task.py::completion_logprobs` 把 `prompt + completion[:-1]` 输入模型，取最后 `len(completion)` 个输出位置，再取目标 token 的 logprob。`logits_to_keep` 只保留所需位置，减少大词表 logits 的占用。
-
-对应的模型前向与取概率代码为（`inputs` 是上述输入，`targets` 是 completion）：
+批量输入右侧补齐，attention mask 标记有效输入。`selected` 收集本批回答预测位置的并集，`logits_to_keep` 只在这些位置执行词表投影：
 
 ```python
-output = model(input_ids=inputs, attention_mask=torch.ones_like(inputs),
-               use_cache=False, logits_to_keep=len(completion))
-logits = output.logits[0]  # [T, V]，V 为词表大小；targets 为 [T]。
+logits = model(input_ids=ids, attention_mask=mask, use_cache=False,
+               logits_to_keep=selected).logits
+columns = torch.searchsorted(selected, torch.tensor(row_positions, device=device))
+targets = torch.tensor(sample["tokens"], device=device)
+logprobs = -F.cross_entropy(logits[i, columns].float(), targets, reduction="none")
 ```
 
-函数返回 `-F.cross_entropy(logits.float(), targets, reduction="none")`：单 token 交叉熵为 $-\log\pi$，取负即得到每个目标 token 的 logprob；转 FP32 用于概率计算的数值稳定性。
+交叉熵取负得到目标 token 的 logprob。每条回答只保留有效 completion 位置，包含首个 EOS，排除 prompt 和 padding；达到长度上限的回答也参与训练。
 
-每次 forward 只处理一条未 padding 的回答，因此不需要在 loss 里构造大批次的 prompt/padding mask：返回的整个向量正好对应有效 completion。`trim_completion` 保留首个 EOS，删除其后的 padding；达到生成上限但未遇到 EOS 的回答仍保留，另行记录截断率。
+### 损失与参数更新
 
-## 新旧策略的概率比
-
-概率比为：
-
-\[
-\rho_{i,t}=\exp\bigl(\log\pi_\theta(o_{i,t}\mid q,o_{i,<t})
--\log\pi_{\mathrm{old}}(o_{i,t}\mid q,o_{i,<t})\bigr).
-\]
-
-对应 `grpo_loss` 的第一步：
-
-```python
-ratio = torch.exp(logprobs - old_logprobs)
-```
-
-`logprobs` 来自更新时的当前策略，保留梯度；`old_logprobs` 是 rollout 缓存的固定值。
-
-## Clipped 策略目标直接写出来
-
-本章实现 PPO clipped surrogate，用组内优势替代 critic 优势：
-
-\[
-\ell_{i,t}^{\mathrm{policy}}=-\min\left(
-\rho_{i,t} A_i,
-\operatorname{clip}(\rho_{i,t},1-\epsilon,1+\epsilon) A_i
-\right),\qquad \epsilon=0.2.
-\]
-
-`task.py::grpo_loss` 的对应代码是：
+`task.py::grpo_loss` 直接实现概率比和裁剪目标：
 
 ```python
 ratio = torch.exp(logprobs - old_logprobs)
@@ -185,33 +183,7 @@ clipped = ratio.clamp(1 - clip, 1 + clip) * advantage
 policy = -torch.minimum(unclipped, clipped)
 ```
 
-正优势鼓励提高回答的概率；负优势鼓励降低。`min` 根据优势符号选择受限制的方向，不能简单理解成“任何超过阈值的 ratio 都没有梯度”。日志中的 `clip_fraction` 统计 clipped 分支严格改变目标的 token 比例。
-
-本章先对一条回答的 token 求均值，再对全局真实回答求均值：
-
-\[
-L=\frac{1}{N}\sum_{i=1}^{N}\frac{1}{T_i}\sum_{t=1}^{T_i}\ell_{i,t}.
-\]
-
-按 micro-batch backward 是显存上的拆分，所有回答累积完才执行 optimizer step，算法上仍是这一个全局均值。默认 AdamW 的学习率为 `4e-5`、betas 为 `(0.9, 0.95)`、weight decay 为 0；梯度范数上限 1。
-
-默认每批只更新一次。更新前 current 与 old 相同，ratio 应接近 1，clip 通常尚未触发。`--updates-per-batch` 可让同一批数据重复更新以观察 ratio 变化，但这改变了参考实验的训练预算。不要根据单次更新实验宣称已验证 clipping 的收益。
-
-初始 ratio=1 且组内优势均值为 0 时，记录的平均 policy loss 可能也是 0；不同回答的 logprob 梯度却不相同，参数仍可获得非零梯度。结合 `grad_norm` 和实际优化步数判断，不能只看 loss 数值。
-
-参考还比较 IS 与 CISPO：IS 使用 $-\rho A$；CISPO 使用 $-\operatorname{detach}(\operatorname{clip}(\rho))\log\pi_\theta A$。本章暂不增加这两套训练分支，先把 GRPO 主线讲清楚。
-
-## 可选 reference KL
-
-主实验 `--beta 0`，不计算、不记录未测得的 KL。小型对照可以使用 `--beta 0.04`：
-
-\[
-\Delta_{i,t}=\log\pi_{\mathrm{ref}}-\log\pi_\theta,
-\quad \widehat D_{i,t}=\exp(\Delta_{i,t})-\Delta_{i,t}-1,
-\quad \ell_{i,t}=\ell_{i,t}^{\mathrm{policy}}+\beta\widehat D_{i,t}.
-\]
-
-`grpo_loss` 在 `beta` 非零时执行：
+开启 KL 时继续计算：
 
 ```python
 delta = ref_logprobs - logprobs
@@ -219,71 +191,59 @@ kl = torch.exp(delta) - delta - 1
 loss = (policy + beta * kl).mean()
 ```
 
-关闭 KL 时则执行 `loss = policy.mean()`。这两个分支都先平均一条回答的有效 token。
+关闭 KL 时取 `policy.mean()`。
 
-基础模型冻结，LoRA 默认零增量初始化。关闭适配器计算 reference logprob，就得到训练初始策略，不需要再放一整份模型。reference 始终固定，old 则每批刷新。
-
-KL 直接加入 loss，不混进奖励再计算组内优势。它是采样 token 上的估计量，不是对整个词表精确求和的 KL。
-
-总奖励全相同的组保留在损失分母中；它们没有奖励优势，但在 beta>0 时仍可产生 KL 约束。仅正确性奖励时，全对或全错的组都是这种情况；开启格式奖励后，格式差异也可能产生优势。beta=0 且整个全局批次没有优势信号时，跳过 optimizer step，避免 Adam 历史动量继续改变参数。采样批次数与实际优化步数分别记录。
-
-## 从 loss 到参数更新
-
-`train.py::update_policy` 批量重新计算当前策略概率，随后调用上面的同一个 `grpo_loss`：
+`train.py::update_policy` 先清空梯度，再按 micro-batch 读取 rollout 记录。每个 micro-batch 批量计算当前策略概率，将缓存的旧概率与 reference 搬到当前设备，逐回答调用损失函数：
 
 ```python
 currents = batch_completion_logprobs(model, chunk)
+for sample, current in zip(chunk, currents, strict=True):
+    old = sample["old"].to(fabric.device)
+    reference = sample["reference"]
+    if reference is not None:
+        reference = reference.to(fabric.device)
+    loss, metrics = grpo_loss(current, old, sample["advantage"], reference,
+                              args.beta, args.clip)
 ```
 
-`old` 和可选的 `reference` 从 rollout 记录搬到当前设备后，传给：
+`current` 保留梯度，缓存的 `old`、`reference` 和 `advantage` 保持固定。每条回答已在 `grpo_loss` 内完成 token 平均，接着按本卡回答数归一，并对本 micro-batch 反传：
 
 ```python
-loss, metrics = grpo_loss(current, old, sample["advantage"], reference,
-                          args.beta, args.clip)
+weighted_losses.append(loss / len(samples))
+fabric.backward(torch.stack(weighted_losses).sum())
 ```
 
-单进程时，每条真实回答的 loss 乘 $1/N$，将一个 micro-batch 的加权 loss 相加，再调用 `fabric.backward(torch.stack(weighted_losses).sum())`。所有回答反传完才统一裁剪梯度、检查有限性并执行 `optimizer.step()`。因此两个平均分别位于 `grpo_loss` 的 `.mean()` 和 `update_policy` 的回答权重中，不是每条回答更新一次参数。
+各 micro-batch 累积到同一次参数更新，只有最后一次反传同步梯度。各卡回答数相同，DDP 平均本卡梯度后得到全局回答均值。整批反传结束后统一裁剪梯度并更新参数：
 
-主循环中 `updates_per_batch` 次更新复用本批回答及固定的 old/reference；下一批才重新采样。无奖励优势且没有 KL 时跳过更新，采样批次数与实际优化步数分别记录。
+```python
+grad_norm = fabric.clip_gradients(model, optimizer, max_norm=args.max_grad_norm)
+optimizer.step()
+```
 
-## 环境和模型
+奖励全相同的组仍保留在损失分母中。`should_update` 汇总全局优势信号：当整批优势均为零且 $\beta=0$ 时跳过更新，避免 Adam 的历史动量继续改变参数。默认每批更新一次；`--updates-per-batch` 可在固定旧概率下重复更新。
 
-整个项目使用根目录的 `.venv`。Python 3.12，依赖版本固定在根目录 `requirements.txt`。以下 CUDA 12.8 安装命令针对本机 NVIDIA 环境；服务器按其驱动选择官方 PyTorch wheel。
+## 运行方法
+
+以下命令从仓库根目录执行，使用 Python 3.12。
+
+### 环境与模型
 
 ```bash
 python -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
 .venv/bin/python -m pip install -r requirements.txt
-```
 
-已有环境也需安装当前 `requirements.txt`，其中包含训练记录所需的 TensorBoard。
-
-从 ModelScope 下载本章当前选定的基础模型：
-
-```bash
 .venv/bin/python -c 'from modelscope import snapshot_download; snapshot_download("Qwen/Qwen2.5-0.5B", local_dir=".cache/models/Qwen2.5-0.5B")'
 ```
 
-默认从这个本地路径加载。[Qwen2.5-0.5B 官方说明](https://huggingface.co/Qwen/Qwen2.5-0.5B)将它标为约 0.49B 参数、仅预训练的基础模型，不是 Instruct 或推理蒸馏版。通过 `AutoModelForCausalLM` 加载，实际模型类为 `Qwen2ForCausalLM`。`--model` 也接受本地目录或 Hugging Face 模型名，方便在服务器上指定模型位置。
+上述 PyTorch 命令使用 CUDA 12.8 wheel。`--model` 默认读取 `.cache/models/Qwen2.5-0.5B`，也接受模型 ID 或其他本地目录。
 
-GSM8K 首次运行由 Datasets 自动下载到 `.cache/datasets`。本章运行产物放在 `experiments/grpo/runs/`；缓存、`.venv` 和各章的 `runs/` 不进入版本控制。本章不需要 PyTRIO、训练 API、vLLM 或额外训练服务。
+### 数据与训练
 
-## 数据划分与运行
+GSM8K 首次运行自动下载到 `.cache/datasets`。从官方 train 按 seed 42 留出 256 题作为验证集，其余题按原始顺序训练，划分保存为 `splits.json`。训练前后及每 50 个采样批次贪心评测一次，默认评测 64 道验证题；`--eval-limit 0` 使用全部验证题。
 
-从 GSM8K train 按 seed 42 固定抽取 256 题作为验证集，剩余题保持原始顺序用于训练。保存真实索引和整个原训练集的内容 SHA256。训练前、训练后及每 50 个采样批次，固定贪心解码评测同一验证子集；默认取 64 题。test 保留给最终评测。
-
-先检查原版模型的小规模基线，不需要先运行训练：
-
-```bash
-.venv/bin/python experiments/grpo/evaluate.py \
-  --limit 16 --max-tokens 1024 \
-  --output experiments/grpo/runs/qwen05-base/baseline.json
-```
-
-省略 `--split-file` 时，按 seed 42 和 validation size 256 创建划分并保存为 `baseline.splits.json`；后续可用 `--split-file` 复用。训练使用相同 seed 和 validation size 时生成相同验证索引。`--limit 0` 才是全部 256 题。
-
-先尝试很小的真实任务流程检查：
+先运行小子集：
 
 ```bash
 .venv/bin/python experiments/grpo/train.py \
@@ -292,131 +252,87 @@ GSM8K 首次运行由 Datasets 自动下载到 `.cache/datasets`。本章运行�
   --max-tokens 128 --eval-limit 2 --eval-max-tokens 128
 ```
 
-短生成上限容易让正确解答来不及输出 boxed 答案，因此这个设置只检查链路。若全零优势跳过了更新，不能把它当作已经完成有效训练。
-
-完整训练配置的起点如下，实际显存与耗时需在目标硬件验证：
+完整训练：
 
 ```bash
 .venv/bin/python experiments/grpo/train.py \
   --output experiments/grpo/runs/qwen05-main \
-  --batch-size 4 --group-size 8 \
-  --max-tokens 1024 --eval-limit 0
+  --batch-size 4 --group-size 8 --max-tokens 1024 --eval-limit 0
 ```
 
-`--micro-batch-size` 默认 1，表示每进程一次训练前向的回答数。试跑可加 `--micro-batch-size 2`；显存不足时调回 1。它不改变每题回答数或每次更新的有效 batch。一个 micro-batch 内右侧补齐，attention mask 排除 padding 的影响，只提取回答预测位置的 logprob；EOS 仍参与 loss，prompt 和 padding 不参与。
-
-`--steps 0`（默认）遍历排除验证题后的训练集，只处理完整的全局 batch，舍弃不足一批的尾部。`--train-limit N` 取其中前 N 题；`--steps N` 限制采样批次数，不会循环重复数据凑步数。`--batch-size` 是**每进程题数**，不是回答数；一次全局完整批次有 `进程数 × batch-size × group-size` 条回答。
-
-多卡启动、梯度同步和训练产物见后面的“工程说明”。
-
-重新加载保存的 LoRA，验证保存链路：
+多卡使用同一入口。下面两卡配置与上面的单卡配置均为每批 4 题、32 条回答：
 
 ```bash
-.venv/bin/python experiments/grpo/evaluate.py \
-  --adapter experiments/grpo/runs/qwen05-smoke/adapter \
-  --split validation --split-file experiments/grpo/runs/qwen05-smoke/splits.json \
-  --limit 2 --max-tokens 128 --output experiments/grpo/runs/qwen05-smoke/reloaded.json
+.venv/bin/torchrun --standalone --nproc_per_node=2 experiments/grpo/train.py \
+  --output experiments/grpo/runs/qwen05-ddp \
+  --batch-size 2 --group-size 8 --max-tokens 1024 --eval-limit 0
 ```
 
-最终在测试集评测时，对基础模型和 LoRA 使用相同生成上限：
+| 参数 | 默认值与含义 |
+| --- | --- |
+| `--batch-size` | 4；每进程每个采样批次的题数，全局回答数为进程数 × batch-size × group-size |
+| `--group-size` | 8；同一道题采样的回答数 |
+| `--micro-batch-size` | 1；每进程一次训练前向的回答数，不改变有效 batch |
+| `--steps` / `--train-limit` | 0 / 0；采样批次数上限 / 训练题数上限，0 使用全部 |
+| `--max-tokens` / `--eval-max-tokens` | 1024 / 1024；采样 / 评测的回答 token 上限 |
+| `--updates-per-batch` | 1；每批回答复用的优化次数 |
+| `--clip` / `--max-grad-norm` | 0.2 / 1；概率比裁剪半径 / 梯度范数上限 |
+| `--learning-rate` | 4e-5；AdamW，betas=(0.9, 0.95)，weight decay=0 |
+| `--lora-rank` / `--lora-alpha` | 32 / 64；all-linear，dropout=0 |
+| `--beta` / `--format-reward-weight` | 0 / 0；KL 系数 / 格式奖励权重 |
+| `--precision` | bf16；可设为 fp32 |
+
+单卡和多卡都舍弃不足一个全局 batch 的训练尾部；数据至少需要一批。`--steps 0` 遍历训练集一遍，`--steps N` 限制批次数。评测使用所选的全部题目。
+
+### KL 与格式奖励对照
+
+各组从基础模型初始化，使用相同的数据划分、训练预算和评测参数：
+
+| 组别 | `--beta` | `--format-reward-weight` |
+| --- | ---: | ---: |
+| baseline | 0 | 0 |
+| kl | 0.04 | 0 |
+| format | 0 | 0.5 |
+| kl-format | 0.04 | 0.5 |
 
 ```bash
-.venv/bin/python experiments/grpo/evaluate.py \
-  --split test --limit 0 --output experiments/grpo/runs/test-base.json
-.venv/bin/python experiments/grpo/evaluate.py \
-  --adapter experiments/grpo/runs/qwen05-main/adapter \
-  --split test --limit 0 --output experiments/grpo/runs/test-grpo.json
-```
-
-## 三类实验与组合对照
-
-所有设置共用 `train.py`，通过两个独立参数切换；不另建训练实现。前三组对应当前 loss、加 KL、加格式奖励，第四组用于检查二者组合。
-
-| 组别 | `--beta` | `--format-reward-weight` | 训练目标 |
-| --- | ---: | ---: | --- |
-| baseline | 0 | 0 | 正确性奖励的 clipped GRPO |
-| kl | 0.04 | 0 | baseline + reference KL |
-| format | 0 | 0.5 | 正确性 + 格式奖励的 clipped GRPO |
-| kl-format | 0.04 | 0.5 | 格式奖励 + reference KL |
-
-以下命令分别运行四组对照实验。四组都从原版 Qwen2.5-0.5B Base 初始化，默认使用相同 seed、数据顺序、batch/group size、学习率、LoRA 配置和生成长度，训练集一遍，验证使用全部 256 题。每组使用独立输出目录，不接着另一组的 adapter 训练。
-
-```bash
-# （1）当前 loss：只有正确性奖励
 .venv/bin/python experiments/grpo/train.py \
   --output experiments/grpo/runs/qwen05-baseline --eval-limit 0 \
   --beta 0 --format-reward-weight 0
-
-# （2）加 KL：与 baseline 比较 KL 的影响
 .venv/bin/python experiments/grpo/train.py \
   --output experiments/grpo/runs/qwen05-kl --eval-limit 0 \
   --beta 0.04 --format-reward-weight 0
-
-# （3）加格式奖励：与 baseline 比较格式奖励的影响
 .venv/bin/python experiments/grpo/train.py \
   --output experiments/grpo/runs/qwen05-format --eval-limit 0 \
   --beta 0 --format-reward-weight 0.5
-
-# 组合对照：与 kl 比较格式奖励；与 format 比较 KL
 .venv/bin/python experiments/grpo/train.py \
   --output experiments/grpo/runs/qwen05-kl-format --eval-limit 0 \
   --beta 0.04 --format-reward-weight 0.5
 ```
 
-本机用子集时，对四组添加相同的 `--train-limit N`、`--steps N` 等参数；多卡也使用相同进程数，保证全局采样题数一致。相同种子不保证不同策略训练中会采出相同回答，应该控制数据和采样预算。
+### 独立评测与训练曲线
 
-结果分别读取各目录的 `validation-after.json` 和 `summary.json`，报告 accuracy、think_format_rate、boxed_rate、生成长度与截断率，并确认 `splits.json` 一致。各组评测始终只用正确性判分，不把训练的总 reward 当作准确率。比较 KL 时固定格式奖励权重，比较格式奖励时固定 beta。
-
-`evaluate.py --measure-kl` 可以诊断相同设置的贪心回答相对 reference 的偏离；这个量不能视为策略分布下的无偏 KL。
-
-## 如何解读结果
-
-独立评测报告正确率、boxed 格式成功率、think 格式成功率、平均生成长度与截断率；实际输入提示词和每题回答也保存下来。训练日志分别记录 `reward`（总奖励）、`accuracy`（采样回答正确率）、`format_reward`（加权格式奖励均值）、`think_format_rate`，以及退化组比例、有效奖励信号 token、ratio、clip 和实际更新次数。格式奖励开启后，总 reward 可以大于 1，各组总 reward 的数值不能直接作为性能比较；训练采样正确率也不能代替留出验证集准确率。若正确率改善主要来自 boxed 格式改善，应按实际原因解释，不能自动归因为数学推理能力增强。
-
-本实现与参考的明确差异：采用 Qwen2.5-0.5B 预训练基础模型和无示例的 think 格式指令；本地文本模型训练替代远程服务；明确选择 LoRA alpha=64、all-linear、dropout=0；只实现 clipped 策略目标；按回答等权归约；保留退化组；增加验证划分、独立贪心评测、可选 KL、可选格式奖励和梯度裁剪。参考远程服务的 LoRA 层选择、内置 loss 归约和梯度缩放未在客户端完整公开，因此不宣称数值等价。
-
-在本章提示词与判分规则下，原版 Qwen2.5-0.5B Base 使用 BF16、贪心解码和 1024 token 上限，在 seed=42 留出的 256 道验证题上答对 69 题，准确率为 26.95%。已有训练只完成少量更新与保存重载检查，尚无完整训练对照或训练收益结论；真实多 GPU 训练也尚未验证。
-
-## 工程说明：多卡、精度与保存
-
-多卡使用同一入口：
+不传 `--adapter` 评测基础模型，传入训练产物的 `adapter/` 评测 LoRA。验证集可通过 `--split-file` 复用训练划分：
 
 ```bash
-.venv/bin/torchrun --standalone --nproc_per_node=2 experiments/grpo/train.py \
-  --output experiments/grpo/runs/qwen05-ddp --batch-size 2 --group-size 8 --eval-limit 0
-```
+.venv/bin/python experiments/grpo/evaluate.py \
+  --adapter experiments/grpo/runs/qwen05-main/adapter \
+  --split validation --split-file experiments/grpo/runs/qwen05-main/splits.json \
+  --limit 0 --max-tokens 1024 --output experiments/grpo/runs/qwen05-main/validation.json
 
-这是 DDP，每卡各有完整基础模型，不会把模型显存分摊到多张卡。完整采样组留在同一进程。单卡和多卡都只处理完整的全局 batch，舍弃不足一批的尾部；数据不足一批时报错，需调小 `--batch-size` 或增加数据。评测仍使用所选的全部题目。
+.venv/bin/python experiments/grpo/evaluate.py \
+  --split test --limit 0 --max-tokens 1024 --output experiments/grpo/runs/test-base.json
+.venv/bin/python experiments/grpo/evaluate.py \
+  --adapter experiments/grpo/runs/qwen05-main/adapter \
+  --split test --limit 0 --max-tokens 1024 --output experiments/grpo/runs/test-grpo.json
 
-`should_update` 汇总各进程的优势信号，让所有进程共同更新或共同跳过；有 KL 时仍更新。`log_batch` 收集回答并汇总日志，`save_adapter` 仅由主进程保存权重和 tokenizer。
-
-`update_policy` 中，前面的 micro-batch 使用 `fabric.no_backward_sync` 在本地累积，最后一个 micro-batch 反传才同步。各卡回答数相同，因此每条回答的 loss 除以本卡回答数，DDP 再对各卡梯度求平均，即得到全局回答均值。
-
-模型加载时关闭 dropout，LoRA dropout 也为 0。BF16/FP32 由参数选择，Fabric 负责训练前向的精度；绕过包装器的采样与评测显式使用同样的 autocast。梯度检查点通过反传时重算激活减少显存占用。`--micro-batch-size` 控制同时保留多少条回答的计算图；增加它可能提高吞吐量，也会增加显存和 padding 开销。
-
-训练产物保存在 `--output`：TensorBoard 超参数配置、划分索引、训练 JSONL、实际 rollout、训练前后逐题验证结果，以及最终的 `adapter/`。每次定期验证前还会保存 `adapter-batch-N/`，可用 `evaluate.py --adapter` 单独评测；检查点仅含模型适配器与 tokenizer，不含优化器或随机数状态，不支持完整恢复训练。评测逐题写入 `*.rank-N.jsonl`，完整结束后汇总为 JSON；中止时已完成的题目仍保留，但未实现自动断点续评。使用新目录启动，避免覆盖旧实验。
-
-不传 `--output` 时，默认使用本章目录下的 `runs/grpo/`，与启动时的工作目录无关；显式传入的相对路径按当前工作目录解析。训练使用 Fabric 的 `TensorBoardLogger`，参数和曲线保存在 `<output>/tensorboard/` 的事件文件中，可在 TensorBoard 的 HParams 页面查看参数，多卡仅由主进程记录全局指标。TensorBoard 的 `train/*` 与 `validation/*` 横轴是采样批次（训练前验证为 0），`update/*` 横轴是实际优化器更新次数；跳过更新的批次仍有采样指标，但没有更新指标。记录包括奖励、准确率、退化组比例、生成长度、截断率、policy loss、总 loss、ratio、clip、梯度范数、学习率，以及启用 KL 时的 KL 值。
-
-从仓库根目录启动，比较本章各次训练：
-
-```bash
 .venv/bin/tensorboard --logdir experiments/grpo/runs
 ```
 
-在浏览器打开 `http://localhost:6006` 查看训练曲线。
+评测输出 accuracy、boxed 格式率、think 格式率、平均生成长度、截断率和逐题回答。对照分析使用相同划分和生成上限，分别比较正确率、格式率与长度变化。
 
-进一步阅读：[DeepSeekMath 论文](https://arxiv.org/abs/2402.03300)、[PEFT LoRA](https://huggingface.co/docs/peft/package_reference/lora)、[Fabric 梯度累积](https://lightning.ai/docs/fabric/stable/advanced/gradient_accumulation.html)。
+训练产物写入 `--output`，默认 `experiments/grpo/runs/grpo/`，包括日志、rollout、训练前后验证结果、`summary.json` 和 LoRA adapter。TensorBoard 在 `http://localhost:6006` 展示参数和曲线；`train/*`、`validation/*` 以采样批次为横轴，`update/*` 以实际优化器更新次数为横轴。
 
-## 验证与试跑（2026-11-07）
+## 实验结果与分析
 
-算法检查使用小随机模型验证 token 对齐、padding 排除及正确的全局归约，不作为任务效果。两进程 CPU DDP 验证了完整批次下的全局回答均值与共同更新决策；真实多 GPU 训练仍未验证。
-
-真实 Qwen2.5-0.5B 已执行一题、每题两条回答的短生成试跑（32 token 上限），完成训练前后验证、日志和 adapter 保存。该批回答全错且优势为零，KL 初值也为零，因此本次自由采样只验证流程；非零 LoRA 更新、KL/格式奖励分支及保存重载由 CUDA 检查中的受控 GSM8K 回答验证。
-
-验证命令：
-
-```bash
-.venv/bin/python -m pytest tests/grpo/test_grpo.py tests/grpo/test_grpo_gpu.py -q
-.venv/bin/torchrun --standalone --nproc_per_node=2 tests/grpo/check_ddp.py
-```
+TODO

@@ -92,7 +92,7 @@ def test_rollout_combines_format_advantages_and_optional_fixed_reference(monkeyp
 
     model = get_peft_model(tiny_model(), LoraConfig(task_type="CAUSAL_LM", r=2, lora_alpha=4,
                                                    target_modules="all-linear", lora_dropout=0.))
-    args = SimpleNamespace(max_tokens=16, group_size=2, standardize_advantages=False,
+    args = SimpleNamespace(max_tokens=16, group_size=2,
                            beta=beta, format_reward_weight=weight)
     # 两条回答都错，只有第一条符合格式；因此只有格式奖励能产生组内差异。
     row = {"index": 0, "question": "What is 4 + 5?", "answer": "#### 9"}
@@ -102,7 +102,7 @@ def test_rollout_combines_format_advantages_and_optional_fixed_reference(monkeyp
     assert [s["reward"] for s in samples] == [weight, 0.]
     assert [s["format_reward"] for s in samples] == [weight, 0.]
     assert [s["think_format"] for s in samples] == [True, False]
-    assert [s["advantage"] for s in samples] == [weight / 2, -weight / 2]
+    assert [s["advantage"] for s in samples] == pytest.approx([1., -1.] if weight else [0., 0.])
     for sample in samples:
         assert not sample["old"].requires_grad
         if beta:
@@ -122,11 +122,11 @@ def test_training_and_evaluation_share_prompt_and_save_each_answer(monkeypatch, 
     tokenizer = RecordingTokenizer()
     model = tiny_model()
     row = {"index": 0, "question": "What is 1 + 1?", "answer": "#### 2"}
-    args = SimpleNamespace(max_tokens=16, group_size=2, standardize_advantages=False,
+    args = SimpleNamespace(max_tokens=16, group_size=2,
                            beta=0., format_reward_weight=0.)
     monkeypatch.setattr(train, "generate", lambda *a, **k: [([7, 2], False), ([8, 2], False)])
     samples = train.rollout(model, tokenizer, [row], args)
-    assert [s["advantage"] for s in samples] == [0.5, -0.5]
+    assert [s["advantage"] for s in samples] == pytest.approx([1., -1.])
     monkeypatch.setattr(evaluate, "generate", lambda *a, **k: [([7, 2], False)])
     fabric = SimpleNamespace(global_rank=0, world_size=1,
                                   is_global_zero=True, autocast=nullcontext,
@@ -153,11 +153,13 @@ def test_boxed_answer_reward():
 
 
 def test_group_advantages_and_degenerate_groups():
-    torch.testing.assert_close(group_advantages([1, 0, 1, 0]), torch.tensor([0.5, -0.5, 0.5, -0.5]))
-    torch.testing.assert_close(group_advantages([1, 0, 1, 0], True), torch.tensor([1., -1., 1., -1.]))
-    for scores in [[0, 0], [1, 1]]:
-        for standardize in [False, True]:
-            torch.testing.assert_close(group_advantages(scores, standardize), torch.zeros(2))
+    torch.testing.assert_close(group_advantages([1, 0, 1, 0]), torch.tensor([1., -1., 1., -1.]))
+    # 不均衡奖励区分总体标准差与样本标准差；奖励整体缩放不改变优势。
+    expected = torch.tensor([3**0.5, -1 / 3**0.5, -1 / 3**0.5, -1 / 3**0.5])
+    for scores in [[1, 0, 0, 0], [2, 0, 0, 0]]:
+        torch.testing.assert_close(group_advantages(scores), expected)
+    for scores in [[0, 0], [1, 1], [0.5, 0.5]]:
+        torch.testing.assert_close(group_advantages(scores), torch.zeros(2))
 
 
 def test_positive_and_negative_advantage_gradient():

@@ -237,19 +237,16 @@ def batch_completion_logprobs(model, samples):
 
 
 
-def group_advantages(rewards, standardize=False):
+def group_advantages(rewards):
     """输入同一道题 G 个标量奖励，返回 CPU float32 优势张量 [G]。
 
-    默认 A_i = R_i - mean(R)，以组内均值作基线，无需训练价值网络。
-    standardize=True 时再除以组内总体标准差 std(R) + 1e-8。
+    A_i = (R_i - mean(R)) / (std(R) + 1e-8)，使用组内总体标准差。
+    以组内均值作基线，无需训练价值网络。
     同组总奖励全相同时优势为 0，没有奖励差异的策略梯度信号。
     默认仅正确性奖励时，全对或全错都会如此；加格式奖励后还要看格式是否不同。
     """
     rewards = torch.tensor(rewards, dtype=torch.float32)
-    advantages = rewards - rewards.mean()
-    if standardize:
-        advantages = advantages / (rewards.std(correction=0) + 1e-8)
-    return advantages
+    return (rewards - rewards.mean()) / (rewards.std(correction=0) + 1e-8)
 
 
 def grpo_loss(logprobs, old_logprobs, advantage, ref_logprobs=None, beta=0.0, clip=0.2):
