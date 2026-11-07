@@ -104,29 +104,35 @@ if should_update(samples, args.beta, fabric):
 
 ### Rollout：从题目到训练样本
 
-`rollout` 的输入是本进程的题目列表 `rows`，输出是回答记录列表 `samples`。若本进程有 $B$ 道题，输出就有 $B\times G$ 条记录。每道题先编码为 prompt，再一次生成该题的 $G$ 个回答：
+`rollout` 的输入是本进程的题目列表 `rows`，输出是回答记录列表 `samples`。若本进程有 $B$ 道题，输出就有 $B\times G$ 条记录。先将所有题目编码为 prompts，一次生成 $B\times G$ 个回答，再按每题 $G$ 条还原分组：
 
 ```python
-prompt = prompt_ids(tokenizer, row["question"])
-completions = generate(model, tokenizer, prompt, args.max_tokens, args.group_size)
-texts = [tokenizer.decode(tokens, skip_special_tokens=True) for tokens, _ in completions]
-scores = [training_rewards(text, ground_truth(row["answer"]), args.format_reward_weight)
-          for text in texts]
-rewards = [score["reward"] for score in scores]
-advantages = group_advantages(rewards)
+prompts = [prompt_ids(tokenizer, row["question"]) for row in rows]
+generated = generate(model, tokenizer, prompts, args.max_tokens, args.group_size)
+for i, (row, prompt) in enumerate(zip(rows, prompts, strict=True)):
+    completions = generated[i * args.group_size:(i + 1) * args.group_size]
+    texts = [tokenizer.decode(tokens, skip_special_tokens=True) for tokens, _ in completions]
+    scores = [training_rewards(text, ground_truth(row["answer"]), args.format_reward_weight)
+              for text in texts]
+    advantages = group_advantages([score["reward"] for score in scores])
 ```
 
-`generate` 返回每条回答的 token ID 和截断标记；解码文本用于判分，原始 token ID 留给后续概率计算。同题的奖励单独标准化为优势。采样设置为 temperature=1、top-p=1、top-k=0、repetition penalty=1，模型和 LoRA 的 dropout 均为 0。
+`generate` 将不同长度的 prompt 左侧补齐，使用 attention mask 屏蔽 padding。`num_return_sequences=G` 在生成器内按题展开，形成 $B\times G$ 条序列。所有回答从补齐后的输入宽度开始切片，保留首个 EOS 并删除后续 padding。返回的原始回答 token 用于概率计算，解码文本用于判分；优势只在同一道题内标准化。
 
-随后遍历该题回答，在无梯度上下文中缓存概率：
+采样设置为 temperature=1、top-p=1、top-k=0、repetition penalty=1，模型和 LoRA 的 dropout 均为 0。批量采样会改变随机数消耗顺序，同一个 seed 不保证与逐题采样生成相同文本。
+
+组装好回答记录后，按 `micro_batch_size` 分块，在无梯度上下文中缓存概率：
 
 ```python
 with torch.no_grad():
-    old = completion_logprobs(model, prompt, tokens).cpu()
-    reference = None
+    old = batch_completion_logprobs(model, chunk)
+    reference = [None] * len(chunk)
     if args.beta:
         with model.disable_adapter():
-            reference = completion_logprobs(model, prompt, tokens).cpu()
+            reference = batch_completion_logprobs(model, chunk)
+    for record, logp, ref in zip(chunk, old, reference, strict=True):
+        record["old"] = logp.cpu()
+        record["reference"] = ref.cpu() if ref is not None else None
 ```
 
 每条记录保存 `prompt`、`tokens`、`reward`、`advantage`、`old` 和 `reference`，以及回答文本和截断标记。`old` 与 `reference` 是长度等于有效回答 token 数的向量，`advantage` 是该回答的标量。
@@ -193,16 +199,13 @@ loss = (policy + beta * kl).mean()
 
 关闭 KL 时取 `policy.mean()`。
 
-`train.py::update_policy` 先清空梯度，再按 micro-batch 读取 rollout 记录。每个 micro-batch 批量计算当前策略概率，将缓存的旧概率与 reference 搬到当前设备，逐回答调用损失函数：
+`train.py::update_policy` 先清空梯度，再按 micro-batch 读取 rollout 记录。`fabric.to_device` 将当前块中缓存的旧概率与 reference 张量搬到当前设备，保留其余字段和 `None`。随后批量计算当前策略概率，逐回答调用损失函数：
 
 ```python
+chunk = fabric.to_device(samples[start:start + micro])
 currents = batch_completion_logprobs(model, chunk)
 for sample, current in zip(chunk, currents, strict=True):
-    old = sample["old"].to(fabric.device)
-    reference = sample["reference"]
-    if reference is not None:
-        reference = reference.to(fabric.device)
-    loss, metrics = grpo_loss(current, old, sample["advantage"], reference,
+    loss, metrics = grpo_loss(current, sample["old"], sample["advantage"], sample["reference"],
                               args.beta, args.clip)
 ```
 
@@ -271,8 +274,9 @@ GSM8K 首次运行自动下载到 `.cache/datasets`。从官方 train 按 seed 4
 | 参数 | 默认值与含义 |
 | --- | --- |
 | `--batch-size` | 4；每进程每个采样批次的题数，全局回答数为进程数 × batch-size × group-size |
+| `--eval-batch-size` | 8；每进程一次验证生成的题数 |
 | `--group-size` | 8；同一道题采样的回答数 |
-| `--micro-batch-size` | 1；每进程一次训练前向的回答数，不改变有效 batch |
+| `--micro-batch-size` | 1；每进程一次概率计算的回答数，用于旧/reference 概率缓存及训练前向，不改变有效 batch |
 | `--steps` / `--train-limit` | 0 / 0；采样批次数上限 / 训练题数上限，0 使用全部 |
 | `--max-tokens` / `--eval-max-tokens` | 1024 / 1024；采样 / 评测的回答 token 上限 |
 | `--updates-per-batch` | 1；每批回答复用的优化次数 |
@@ -281,6 +285,8 @@ GSM8K 首次运行自动下载到 `.cache/datasets`。从官方 train 按 seed 4
 | `--lora-rank` / `--lora-alpha` | 32 / 64；all-linear，dropout=0 |
 | `--beta` / `--format-reward-weight` | 0 / 0；KL 系数 / 格式奖励权重 |
 | `--precision` | bf16；可设为 fp32 |
+
+rollout 一次生成每进程 `batch-size × group-size` 条回答；`micro-batch-size` 只控制后续概率计算，不限制生成批量。
 
 单卡和多卡都舍弃不足一个全局 batch 的训练尾部；数据至少需要一批。`--steps 0` 遍历训练集一遍，`--steps N` 限制批次数。评测使用所选的全部题目。
 
@@ -312,6 +318,8 @@ GSM8K 首次运行自动下载到 `.cache/datasets`。从官方 train 按 seed 4
 
 ### 独立评测与训练曲线
 
+评测按题批量贪心生成，使用与 rollout 相同的左侧 padding 和回答切片。独立评测的 `--batch-size`（默认 8）与训练入口的 `--eval-batch-size` 控制每进程的评测批量；尾部不足一批仍全部评测。可选的 `--measure-kl` 也按该批量计算回答概率，最后按题平均诊断值。
+
 不传 `--adapter` 评测基础模型，传入训练产物的 `adapter/` 评测 LoRA。验证集可通过 `--split-file` 复用训练划分：
 
 ```bash
@@ -331,7 +339,7 @@ GSM8K 首次运行自动下载到 `.cache/datasets`。从官方 train 按 seed 4
 
 评测输出 accuracy、boxed 格式率、think 格式率、平均生成长度、截断率和逐题回答。对照分析使用相同划分和生成上限，分别比较正确率、格式率与长度变化。
 
-训练产物写入 `--output`，默认 `experiments/grpo/runs/grpo/`，包括日志、rollout、训练前后验证结果、`summary.json` 和 LoRA adapter。TensorBoard 在 `http://localhost:6006` 展示参数和曲线；`train/*`、`validation/*` 以采样批次为横轴，`update/*` 以实际优化器更新次数为横轴。
+训练产物写入 `--output`，默认 `experiments/grpo/runs/grpo/`。运行参数和标量指标由 Fabric 的 TensorBoard logger 保存到 `tensorboard/`；逐条回答保存在 `rollouts.jsonl`，另保存训练前后验证结果、`summary.json` 和 LoRA adapter。TensorBoard 在 `http://localhost:6006` 展示参数和曲线；`train/*`、`validation/*` 以采样批次为横轴，`update/*` 以实际优化器更新次数为横轴。
 
 ## 实验结果与分析
 

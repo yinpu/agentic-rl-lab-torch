@@ -93,7 +93,7 @@ def test_rollout_combines_format_advantages_and_optional_fixed_reference(monkeyp
     model = get_peft_model(tiny_model(), LoraConfig(task_type="CAUSAL_LM", r=2, lora_alpha=4,
                                                    target_modules="all-linear", lora_dropout=0.))
     args = SimpleNamespace(max_tokens=16, group_size=2,
-                           beta=beta, format_reward_weight=weight)
+                           beta=beta, format_reward_weight=weight, micro_batch_size=3)
     # 两条回答都错，只有第一条符合格式；因此只有格式奖励能产生组内差异。
     row = {"index": 0, "question": "What is 4 + 5?", "answer": "#### 9"}
     monkeypatch.setattr(train, "generate", lambda *a, **k: [([7, 2], False), ([8, 2], False)])
@@ -123,7 +123,7 @@ def test_training_and_evaluation_share_prompt_and_save_each_answer(monkeypatch, 
     model = tiny_model()
     row = {"index": 0, "question": "What is 1 + 1?", "answer": "#### 2"}
     args = SimpleNamespace(max_tokens=16, group_size=2,
-                           beta=0., format_reward_weight=0.)
+                           beta=0., format_reward_weight=0., micro_batch_size=2)
     monkeypatch.setattr(train, "generate", lambda *a, **k: [([7, 2], False), ([8, 2], False)])
     samples = train.rollout(model, tokenizer, [row], args)
     assert [s["advantage"] for s in samples] == pytest.approx([1., -1.])
@@ -309,3 +309,96 @@ def test_training_size_rejects_unusable_batches(count, batch_size, world_size):
     from experiments.grpo.train import training_size
     with pytest.raises(ValueError):
         training_size(count, batch_size, world_size)
+
+
+class GenerationTokenizer:
+    # pad == EOS 时也必须按位置创建 mask，不能按 token 值推断。
+    pad_token_id = 2
+    eos_token_id = 2
+
+    def get_vocab(self):
+        return {"<|im_end|>": 3}
+
+    def convert_tokens_to_ids(self, token):
+        return self.get_vocab()[token]
+
+
+def test_batched_generation_padding_group_order_and_eos(monkeypatch):
+    from experiments.grpo.task import generate
+    model = tiny_model()
+
+    def fake_generate(input_ids, attention_mask, generation_config):
+        assert input_ids.tolist() == [[2, 2, 4], [5, 2, 6]]
+        assert attention_mask.tolist() == [[0, 0, 1], [1, 1, 1]]
+        assert generation_config.num_return_sequences == 2
+        assert generation_config.top_k == 0 and generation_config.top_p == 1.
+        # 与 Transformers 一样按题 repeat_interleave；覆盖两种 EOS 及未结束回答。
+        tails = torch.tensor([[7, 2, 2], [8, 9, 3], [10, 3, 2], [11, 12, 13]])
+        return torch.cat([input_ids.repeat_interleave(2, dim=0), tails], dim=1)
+
+    monkeypatch.setattr(model, "generate", fake_generate)
+    assert generate(model, GenerationTokenizer(), [[4], [5, 2, 6]], 3, group_size=2) == [
+        ([7, 2], False), ([8, 9, 3], False), ([10, 3], False), ([11, 12, 13], True)]
+
+
+def test_batched_greedy_generation_matches_individual_prompts():
+    from experiments.grpo.task import generate
+    model, tokenizer = tiny_model(), GenerationTokenizer()
+    prompts = [[4], [5, 2, 6], [7, 8]]
+    actual = generate(model, tokenizer, prompts, 5, sample=False)
+    expected = [generate(model, tokenizer, [prompt], 5, sample=False)[0] for prompt in prompts]
+    assert actual == expected
+
+
+def test_rollout_batches_questions_but_keeps_advantages_within_question(monkeypatch):
+    from types import SimpleNamespace
+    from experiments.grpo import train
+    calls = []
+
+    def generate(model, tokenizer, prompts, max_tokens, group_size):
+        calls.append((prompts, group_size))
+        return [([7, 2], False), ([8, 2], False), ([7, 2], False), ([7, 2], False)]
+
+    monkeypatch.setattr(train, "generate", generate)
+    rows = [{"index": i, "question": str(i), "answer": "#### 2"} for i in range(2)]
+    args = SimpleNamespace(max_tokens=16, group_size=2, beta=0.,
+                           format_reward_weight=0., micro_batch_size=3)
+    model = tiny_model()
+    samples = train.rollout(model, RecordingTokenizer(), rows, args)
+    assert calls == [([[4, 5, 6], [4, 5, 6]], 2)]
+    assert [s["index"] for s in samples] == [0, 0, 1, 1]
+    assert [s["advantage"] for s in samples] == pytest.approx([1., -1., 0., 0.])
+    for s in samples:
+        torch.testing.assert_close(s["old"], completion_logprobs(model, s["prompt"], s["tokens"]))
+        assert not s["old"].requires_grad
+
+
+@pytest.mark.parametrize("measure_kl", [False, True])
+def test_evaluation_batches_keep_tail_and_question_mean(monkeypatch, tmp_path, measure_kl):
+    import json
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from experiments.grpo import evaluate
+    calls = []
+
+    def generate(model, tokenizer, prompts, max_tokens, sample):
+        calls.append(len(prompts))
+        assert sample is False
+        return [([7, 2], False)] * len(prompts)
+
+    monkeypatch.setattr(evaluate, "generate", generate)
+    model = get_peft_model(tiny_model(), LoraConfig(task_type="CAUSAL_LM", r=2,
+                                                   target_modules="all-linear"))
+    rows = [{"index": i, "question": str(i), "answer": f"#### {2 if i < 2 else 9}"}
+            for i in range(3)]
+    fabric = SimpleNamespace(global_rank=0, world_size=1, is_global_zero=True,
+                             autocast=nullcontext, barrier=lambda: None)
+    metrics = evaluate.evaluate_model(model, RecordingTokenizer(), rows, fabric, 16,
+                                     tmp_path / "eval.json", measure_kl, batch_size=2)
+    assert calls == [2, 1]
+    assert metrics["questions"] == 3 and metrics["accuracy"] == pytest.approx(2 / 3)
+    if measure_kl:
+        assert metrics["greedy_token_kl"] == pytest.approx(0.)
+    results = json.loads((tmp_path / "eval.json").read_text())["results"]
+    assert [r["index"] for r in results] == [0, 1, 2]
+    assert len((tmp_path / "eval.rank-0.jsonl").read_text().splitlines()) == 3

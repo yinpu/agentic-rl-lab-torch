@@ -136,8 +136,8 @@ def test_qwen_gpu_reward_update_and_reload(beta, weight, monkeypatch, tmp_path):
             current = completion_logprobs(raw_model, sample["prompt"], sample["tokens"])
             reloaded = completion_logprobs(restored, sample["prompt"], sample["tokens"])
             torch.testing.assert_close(reloaded, current, rtol=0, atol=0)
-        current_tokens = generate(raw_model, tokenizer, samples[0]["prompt"], 32, sample=False)
-        restored_tokens = generate(restored, restored_tokenizer, samples[0]["prompt"], 32, sample=False)
+        current_tokens = generate(raw_model, tokenizer, [samples[0]["prompt"]], 32, sample=False)
+        restored_tokens = generate(restored, restored_tokenizer, [samples[0]["prompt"]], 32, sample=False)
     assert current_tokens == restored_tokens
     write_json(tmp_path / "report.json", {
         "verified_at": datetime.now().astimezone().isoformat(), "model": DEFAULT_MODEL,

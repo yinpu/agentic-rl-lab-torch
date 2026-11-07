@@ -170,17 +170,24 @@ def trim_completion(tokens, stop_ids):
 
 
 @torch.no_grad()
-def generate(model, tokenizer, prompt, max_tokens, group_size=1, sample=True):
-    """给同一道题生成回答，返回 group_size 个 (tokens, truncated)。
+def generate(model, tokenizer, prompts, max_tokens, group_size=1, sample=True):
+    """左侧 padding 后批量生成，返回按题连续排列的 B*G 个 (tokens, truncated)。
 
-    prompt 是长度 P 的 ID 列表；max_tokens 只限制新增回答长度，不含提示词。
-    tokens 仅含回答 ID；若生成 EOS 则保留首个 EOS，删除其后的 padding。
-    训练用 sample=True 从当前策略独立采样 G=group_size 条；评测用
-    sample=False、group_size=1 贪心生成。本函数不建立梯度图。
+    prompts 是 B 个未补齐的 ID 列表；每题由 num_return_sequences 扩展为 G 条。
+    左侧补齐让所有 prompt 的最后一个有效 token 位于同一列，回答统一从
+    padded width 开始。attention_mask 屏蔽 padding，生成器据此构造位置编号。
+    训练独立采样 G 条，评测使用 sample=False、group_size=1 贪心生成。
+    返回值仅含回答，保留首个 EOS、删除其后的 padding。
     """
     model.eval()
     device = next(model.parameters()).device
-    inputs = torch.tensor([prompt], device=device)  # [1, P]：一次处理一道题。
+    width = max(map(len, prompts))
+    inputs = torch.full((len(prompts), width), tokenizer.pad_token_id,
+                        dtype=torch.long, device=device)
+    mask = torch.zeros_like(inputs)
+    for i, prompt in enumerate(prompts):
+        inputs[i, -len(prompt):] = torch.tensor(prompt, device=device)
+        mask[i, -len(prompt):] = 1
     # 新建配置，避免继承模型仓库的 top-k、repetition penalty 等默认变换。
     config = GenerationConfig(
         max_new_tokens=max_tokens, do_sample=sample, num_return_sequences=group_size,
@@ -190,10 +197,10 @@ def generate(model, tokenizer, prompt, max_tokens, group_size=1, sample=True):
         # 不改变温度或截断词表，使采样分布与后面计算 logprob 的策略一致。
         **({"temperature": 1.0, "top_p": 1.0, "top_k": 0} if sample else {}),
     )
-    output = model.generate(input_ids=inputs, attention_mask=torch.ones_like(inputs),
+    output = model.generate(input_ids=inputs, attention_mask=mask,
                             generation_config=config)
-    # output 为 [G, P + 生成长度]；这里只返回回答，提示词不计入 loss。
-    return [trim_completion(seq[len(prompt):].tolist(), eos_ids(tokenizer)) for seq in output]
+    # output 为 [B*G, width + 生成长度]；切片使用补齐宽度，不用各题原始长度。
+    return [trim_completion(seq[width:].tolist(), eos_ids(tokenizer)) for seq in output]
 
 
 def completion_logprobs(model, prompt, completion):

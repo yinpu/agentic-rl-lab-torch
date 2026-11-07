@@ -17,7 +17,7 @@ if __package__ in (None, ""):
     __package__ = "experiments.grpo"
 
 from .evaluate import evaluate_model, gather_records
-from .task import (DEFAULT_MODEL, TASK_INSTRUCTION, batch_completion_logprobs, completion_logprobs,
+from .task import (DEFAULT_MODEL, TASK_INSTRUCTION, batch_completion_logprobs,
                   generate, ground_truth,
                   group_advantages, grpo_loss, load_gsm8k, load_model, make_split,
                   prompt_ids, rows_at, training_rewards, write_json)
@@ -31,7 +31,7 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=0, help="采样批次数上限；0 为训练集一遍")
     parser.add_argument("--train-limit", type=int, default=0, help="排除验证题后取前 N 题；0 为全部")
     # W 个进程每批最多采样 batch_size * W 道题，每题生成 group_size 条回答。
-    parser.add_argument("--micro-batch-size", type=int, default=1, help="每进程一次训练前向的样本数；不改变有效 batch")
+    parser.add_argument("--micro-batch-size", type=int, default=1, help="每进程一次概率计算的回答数（缓存及训练）；不改变有效 batch")
     parser.add_argument("--batch-size", type=int, default=4, help="每进程每个采样批次的题数")
     parser.add_argument("--group-size", type=int, default=8, help="同一道题的回答数，至少为 2")
     parser.add_argument("--max-tokens", type=int, default=1024)  # 每条回答的新增 token 上限。
@@ -48,11 +48,12 @@ def parse_args():
     parser.add_argument("--validation-size", type=int, default=256)  # 从官方 train 留出的题数。
     parser.add_argument("--eval-limit", type=int, default=64, help="固定验证题数；0 为全部验证集")
     parser.add_argument("--eval-every", type=int, default=50, help="每 N 个采样批次验证；0 仅训练前后验证")
+    parser.add_argument("--eval-batch-size", type=int, default=8, help="每进程一次评测生成的题数")
     parser.add_argument("--eval-max-tokens", type=int, default=1024)  # 验证时每条回答的长度上限。
     parser.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")
     args = parser.parse_args()
     for name in ["micro_batch_size", "batch_size", "max_tokens", "updates_per_batch", "lora_rank", "lora_alpha",
-                 "eval_max_tokens", "validation_size"]:
+                 "eval_max_tokens", "eval_batch_size", "validation_size"]:
         if getattr(args, name) < 1:
             parser.error(f"{name} must be >= 1")
     if args.group_size < 2 or not 0 < args.clip < 1:
@@ -72,7 +73,7 @@ def rollout(model, tokenizer, rows, args):
     """用更新前的策略采样、判分，返回本进程的回答记录列表 samples。
 
     model 是解开 DDP 包装的 LoRA 模型；rows 为含 index/question/answer 的题目列表。
-    args 使用 max_tokens、group_size、beta 和 format_reward_weight。
+    args 使用 max_tokens、group_size、beta、format_reward_weight 和 micro_batch_size。
     B 道题返回 B*G 条记录，同题的 G 条回答连续排列。关键字段：
       prompt/tokens：提示词/回答 ID 列表，长度分别为 P/T；
       old/reference：冻结的逐 token logprob，CPU 张量 [T]，reference 可为 None；
@@ -82,10 +83,11 @@ def rollout(model, tokenizer, rows, args):
     """
     model.eval()
     samples = []
-    for row in rows:
-        prompt = prompt_ids(tokenizer, row["question"])
-        # 对同一道题从当前策略采样 G 个回答，构成一个比较组。
-        completions = generate(model, tokenizer, prompt, args.max_tokens, args.group_size)
+    prompts = [prompt_ids(tokenizer, row["question"]) for row in rows]
+    # 一次生成 B*G 条回答；Transformers 按题重复 G 次，同题回答连续排列。
+    generated = generate(model, tokenizer, prompts, args.max_tokens, args.group_size)
+    for i, (row, prompt) in enumerate(zip(rows, prompts, strict=True)):
+        completions = generated[i * args.group_size:(i + 1) * args.group_size]
         texts = [tokenizer.decode(tokens, skip_special_tokens=True) for tokens, _ in completions]
         # 逐回答打分：正确性奖励加可选的格式奖励，得到 R_i。
         scores = [training_rewards(text, ground_truth(row["answer"]), args.format_reward_weight)
@@ -96,18 +98,21 @@ def rollout(model, tokenizer, rows, args):
         # 每一道题单独构成一组；不能把不同题目的奖励混在一起计算均值。
         advantages = group_advantages(rewards)
         for (tokens, truncated), text, score, advantage in zip(completions, texts, scores, advantages, strict=True):
-            with torch.no_grad():
-                # πold 只在采样阶段计算一次，多次 update 时也不重算。
-                old = completion_logprobs(model, prompt, tokens).cpu()
-                reference = None
-                if args.beta:
-                    # 基础权重始终冻结；临时关闭 LoRA，即得到固定的 πref。
-                    # 它不同于每轮重新采样前的 πold。
-                    with model.disable_adapter():
-                        reference = completion_logprobs(model, prompt, tokens).cpu()
-            samples.append({"prompt": prompt, "tokens": tokens, "old": old, "reference": reference,
+            samples.append({"prompt": prompt, "tokens": tokens,
                             "advantage": advantage.item(), "index": row["index"],
                             "response": text, "truncated": truncated, **score})
+    # 旧策略与固定参考策略复用批量 logprob，按 micro-batch 控制前向显存。
+    with torch.no_grad():
+        for start in range(0, len(samples), args.micro_batch_size):
+            chunk = samples[start:start + args.micro_batch_size]
+            old = batch_completion_logprobs(model, chunk)
+            reference = [None] * len(chunk)
+            if args.beta:
+                with model.disable_adapter():
+                    reference = batch_completion_logprobs(model, chunk)
+            for record, logp, ref in zip(chunk, old, reference, strict=True):
+                record["old"] = logp.cpu()
+                record["reference"] = ref.cpu() if ref is not None else None
     return samples
 
 
@@ -134,17 +139,13 @@ def update_policy(model, optimizer, samples, args, fabric):
     metrics_sum = {}
     micro = args.micro_batch_size
     for start in range(0, len(samples), micro):
-        chunk = samples[start:start + micro]
+        chunk = fabric.to_device(samples[start:start + micro])
         # 只有最后一次反向同步梯度；context 同时覆盖 forward 和 backward。
         with fabric.no_backward_sync(model, enabled=start + micro < len(samples)):
             currents = batch_completion_logprobs(model, chunk)
             weighted_losses = []
             for sample, current in zip(chunk, currents, strict=True):
-                old = sample["old"].to(fabric.device)
-                reference = sample["reference"]
-                if reference is not None:
-                    reference = reference.to(fabric.device)
-                loss, metrics = grpo_loss(current, old, sample["advantage"], reference,
+                loss, metrics = grpo_loss(current, sample["old"], sample["advantage"], sample["reference"],
                                           args.beta, args.clip)
                 # 各卡回答数相同：本卡回答均值再经 DDP 平均，即全局回答均值。
                 weighted_losses.append(loss / len(samples))
@@ -167,7 +168,7 @@ def should_update(samples, beta, fabric):
 
 
 def log_batch(samples, prompt_count, group_size, batch_index,
-              optimizer_steps, update_metrics, output, fabric):
+              optimizer_steps, output, fabric):
     """收集各进程的回答与指标，由主进程写入日志。"""
     records = gather_records([{k: s[k] for k in ["index", "reward", "correct", "format_reward",
                                                "think_format", "advantage", "response", "truncated"]}
@@ -184,13 +185,10 @@ def log_batch(samples, prompt_count, group_size, batch_index,
                "frac_degenerate": sum(all(s["advantage"] == 0 for s in g) for g in groups) / len(groups),
                "mean_tokens": sum(s["tokens"] for s in records) / len(records),
                "truncation_rate": sum(s["truncated"] for s in records) / len(records),
-               "signal_tokens": sum(s["tokens"] for s in records if s["advantage"] != 0),
-               "updates": update_metrics}
-        with (output / "train.jsonl").open("a") as f:
-            f.write(json.dumps(log, ensure_ascii=False) + "\n")
+               "signal_tokens": sum(s["tokens"] for s in records if s["advantage"] != 0)}
         with (output / "rollouts.jsonl").open("a") as f:
             f.write(json.dumps({"batch": batch_index, "samples": records}, ensure_ascii=False) + "\n")
-        fabric.log_dict({f"train/{k}": v for k, v in log.items() if k not in ("batch", "updates")},
+        fabric.log_dict({f"train/{k}": v for k, v in log.items() if k != "batch"},
                         step=batch_index)
         print(json.dumps(log, ensure_ascii=False), flush=True)
 
@@ -246,7 +244,7 @@ def main(args):
 
     # 训练前评测：记录初始策略在固定验证题上的正确率。
     before = evaluate_model(raw_model, tokenizer, validation, fabric, args.eval_max_tokens,
-                            args.output / "validation-before.json")
+                            args.output / "validation-before.json", batch_size=args.eval_batch_size)
     fabric.log_dict({f"validation/{k}": v for k, v in before.items()}, step=0)
     optimizer_steps = 0
     completed_batches = 0
@@ -259,33 +257,31 @@ def main(args):
         # 采样：每题生成 G 个回答，计算奖励和组内优势，并固定本批 πold 的概率。
         with fabric.autocast():
             samples = rollout(raw_model, tokenizer, local_rows, args)
-        update_metrics = []
         # 有非零优势或启用 KL 时才更新；否则本批不执行优化器步。
         if should_update(samples, args.beta, fabric):
             # 策略更新：重算 πθ 的概率，用优势、概率比、clip 和可选 KL 计算 loss。
             # 同批多次更新始终固定 πold；下一批才用更新后的策略重新采样。
-            for update in range(args.updates_per_batch):
+            for _ in range(args.updates_per_batch):
                 metrics = update_policy(model, optimizer, samples, args, fabric)
                 optimizer_steps += 1
-                update_metrics.append({"update": update + 1, **metrics})
                 fabric.log_dict({f"update/{k}": v for k, v in metrics.items()} | {
                     "update/loss": metrics["policy_loss"] + args.beta * metrics.get("kl", 0.0),
                     "update/learning_rate": optimizer.param_groups[0]["lr"],
                 }, step=optimizer_steps)
         log_batch(samples, len(batch), args.group_size, batch_index,
-                  optimizer_steps, update_metrics, args.output, fabric)
+                  optimizer_steps, args.output, fabric)
         completed_batches = batch_index
         if args.eval_every and batch_index % args.eval_every == 0:
             # 定期评测：用相同验证题和贪心解码观察当前策略的表现。
             save_adapter(raw_model, tokenizer, args.output / f"adapter-batch-{batch_index}", fabric)
             fabric.barrier()
             metrics = evaluate_model(raw_model, tokenizer, validation, fabric, args.eval_max_tokens,
-                                     args.output / f"validation-batch-{batch_index}.json")
+                                     args.output / f"validation-batch-{batch_index}.json", batch_size=args.eval_batch_size)
             fabric.log_dict({f"validation/{k}": v for k, v in metrics.items()}, step=batch_index)
             last_validation_batch = batch_index
     # 训练后评测：与初始策略比较，检查留出题目的正确率变化。
     after = evaluate_model(raw_model, tokenizer, validation, fabric, args.eval_max_tokens,
-                           args.output / "validation-after.json")
+                           args.output / "validation-after.json", batch_size=args.eval_batch_size)
     if completed_batches != last_validation_batch:
         fabric.log_dict({f"validation/{k}": v for k, v in after.items()}, step=completed_batches)
     fabric.barrier()
