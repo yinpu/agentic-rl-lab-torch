@@ -6,13 +6,13 @@ GRPO 对同一道题采样多个回答，用组内奖励差异估计优势，再
 
 ### 从回答奖励到策略更新
 
-语言模型是一种自回归策略。给定题目 $q$，它逐 token 生成回答 $o=(o_1,\ldots,o_T)$，回答概率为：
+语言模型是一种自回归策略。给定题目 $`q`$，它逐 token 生成回答 $`o=(o_1,\ldots,o_T)`$，回答概率为：
 
 $$
 \pi_\theta(o\mid q)=\prod_{t=1}^{T}\pi_\theta(o_t\mid q,o_{\lt t}).
 $$
 
-训练希望提高期望奖励 $J(\theta)=\mathbb{E}_{q\sim\mathcal D,\,o\sim\pi_\theta(\cdot\mid q)}[r(q,o)]$。其中 $\mathcal D$ 是训练题目分布。答案判定本身不可微，但可以用策略梯度：提高高于基线的回答的对数概率，降低低于基线的回答的对数概率。GRPO 用同一道题多个回答的奖励均值估计基线，因此不需要另一个模型预测价值；组内差异提供“这条回答相对其他回答好多少”的信号。
+训练希望提高期望奖励 $`J(\theta)=\mathbb{E}_{q\sim\mathcal D,\,o\sim\pi_\theta(\cdot\mid q)}[r(q,o)]`$。其中 $`\mathcal D`$ 是训练题目分布。答案判定本身不可微，但可以用策略梯度：提高高于基线的回答的对数概率，降低低于基线的回答的对数概率。GRPO 用同一道题多个回答的奖励均值估计基线，因此不需要另一个模型预测价值；组内差异提供“这条回答相对其他回答好多少”的信号。
 
 每轮先冻结采样时的策略，得到一批回答及其旧概率，再对同一批 token 重算当前概率并更新参数。回答的奖励和优势在更新期间固定，不对离散采样或答案判定求导。下面依次定义奖励、优势和实际优化的裁剪目标；本章最终采用按回答等权、回答内部按 token 平均的损失。
 
@@ -29,19 +29,19 @@ Problem:
 {question}
 ```
 
-标准答案取 GSM8K `answer` 中 `####` 后的内容。正确性奖励 $c_i$ 提取回答最后一个 `\boxed{...}`，去掉逗号、首尾空白和末尾句点后，与标准答案做字符串比较：相同为 1，否则为 0。
+标准答案取 GSM8K `answer` 中 `####` 后的内容。正确性奖励 $`c_i`$ 提取回答最后一个 `\boxed{...}`，去掉逗号、首尾空白和末尾句点后，与标准答案做字符串比较：相同为 1，否则为 0。
 
-可选格式奖励检查回答是否为一个非空 `<think>...</think>` 块，后面紧跟 boxed 答案。令格式合规标记为 $f_i\in\lbrace 0,1\rbrace $，总奖励为：
+可选格式奖励检查回答是否为一个非空 `<think>...</think>` 块，后面紧跟 boxed 答案。令格式合规标记为 $`f_i\in\lbrace 0,1\rbrace `$，总奖励为：
 
 $$
 r_i=c_i+\lambda f_i.
 $$
 
-默认 $\lambda=0$；设置 `--format-reward-weight 0.5` 时，格式合规额外得 0.5 分。正确性和格式分别打分，独立评测的 accuracy 只使用正确性。
+默认 $`\lambda=0`$；设置 `--format-reward-weight 0.5` 时，格式合规额外得 0.5 分。正确性和格式分别打分，独立评测的 accuracy 只使用正确性。
 
 ### 组内优势
 
-对题目 $q$，旧策略采样 $G$ 个回答，奖励为 $r_1,\ldots,r_G$：
+对题目 $`q`$，旧策略采样 $`G`$ 个回答，奖励为 $`r_1,\ldots,r_G`$：
 
 $$
 \bar r=\frac{1}{G}\sum_{j=1}^{G}r_j,
@@ -49,7 +49,7 @@ $$
 A_i=\frac{r_i-\bar r}{\mathrm{std}(r_1,\ldots,r_G)+10^{-8}}.
 $$
 
-组内均值充当 baseline，无需训练 critic。这里使用总体标准差，同一回答的所有有效 token 共用 $A_i$。例如奖励 `[1, 0, 1, 0]` 得到优势约 `[1, -1, 1, -1]`；奖励全相同时，优势为零。
+组内均值充当 baseline，无需训练 critic。这里使用总体标准差，同一回答的所有有效 token 共用 $`A_i`$。例如奖励 `[1, 0, 1, 0]` 得到优势约 `[1, -1, 1, -1]`；奖励全相同时，优势为零。
 
 ### 裁剪目标与 KL
 
@@ -60,7 +60,7 @@ $$
 -\log\pi_{\mathrm{old}}(o_{i,t}\mid q,o_{i,\lt t})\right).
 $$
 
-策略损失使用 clipped surrogate，默认 $\epsilon=0.2$：
+策略损失使用 clipped surrogate，默认 $`\epsilon=0.2`$：
 
 $$
 \ell^{\mathrm{policy}}_{i,t}=-\min\left(
@@ -69,7 +69,7 @@ $$
 \right).
 $$
 
-正优势提高回答概率，负优势降低回答概率。正优势且 $\rho\gt 1+\epsilon$ 时，继续增大概率不再改善裁剪目标；负优势且 $\rho\lt 1-\epsilon$ 时，继续减小概率也不再改善它。裁剪作用于目标函数，不是将模型概率直接截断。
+正优势提高回答概率，负优势降低回答概率。正优势且 $`\rho\gt 1+\epsilon`$ 时，继续增大概率不再改善裁剪目标；负优势且 $`\rho\lt 1-\epsilon`$ 时，继续减小概率也不再改善它。裁剪作用于目标函数，不是将模型概率直接截断。
 
 可选 KL 约束使用固定基础模型作为 reference：
 
@@ -79,22 +79,22 @@ $$
 \widehat D_{i,t}=e^{\Delta_{i,t}}-\Delta_{i,t}-1.
 $$
 
-先平均每条回答的有效 token，再对全部 $N$ 条回答等权平均：
+先平均每条回答的有效 token，再对全部 $`N`$ 条回答等权平均：
 
 $$
 L=\frac{1}{N}\sum_{i=1}^{N}\frac{1}{T_i}\sum_{t=1}^{T_i}
 \left(\ell^{\mathrm{policy}}_{i,t}+\beta\widehat D_{i,t}\right).
 $$
 
-reference 是固定的初始策略，用来约束训练策略偏离初始模型的程度。上式 $\widehat D$ 是逐 token 的非负 KL 估计项；对当前策略分布取期望时对应当前策略到 reference 的 KL，在复用旧策略采样时作为样本上的正则项计算。
+reference 是固定的初始策略，用来约束训练策略偏离初始模型的程度。上式 $`\widehat D`$ 是逐 token 的非负 KL 估计项；对当前策略分布取期望时对应当前策略到 reference 的 KL，在复用旧策略采样时作为样本上的正则项计算。
 
 有效回答 token 包含首个 EOS，排除 prompt 和 padding。按回答等权使长回答不会仅因 token 更多而获得更大的总权重。所有生成 token 都共享该回答的标量优势，因此本章不对中间推理步骤单独判分。
 
-KL 直接加入 loss，组内优势只使用奖励 $r_i$。默认 $\beta=0$，可用 `--beta 0.04` 开启 KL 对照。
+KL 直接加入 loss，组内优势只使用奖励 $`r_i`$。默认 $`\beta=0`$，可用 `--beta 0.04` 开启 KL 对照。
 
 任务与判分参考 [agentic-rl-lab 的 GRPO 章节](https://github.com/datawhalechina/agentic-rl-lab/tree/8493321013c02eef6cf79ca2594811f53c6fdac1/experiments/grpo)，算法出处为 [DeepSeekMath](https://arxiv.org/abs/2402.03300)。本章选用 Qwen2.5-0.5B Base、无示例 think + boxed 提示词和 LoRA；优势在参考代码减组内均值的基础上再除以标准差，训练目标采用上述 clipped loss 与按回答等权归约。
 
-训练只更新 LoRA 参数：对所选线性层，将冻结权重 $W$ 的输出改为 $Wx+(\alpha/r)BAx$，其中 $A,B$ 是可训练的低秩矩阵，$r$ 是秩，$\alpha/r$ 控制增量的缩放。采样和概率计算都使用带有当前 LoRA 的策略；冻结基础权重不改变上述策略梯度目标。
+训练只更新 LoRA 参数：对所选线性层，将冻结权重 $`W`$ 的输出改为 $`Wx+(\alpha/r)BAx`$，其中 $`A,B`$ 是可训练的低秩矩阵，$`r`$ 是秩，$`\alpha/r`$ 控制增量的缩放。采样和概率计算都使用带有当前 LoRA 的策略；冻结基础权重不改变上述策略梯度目标。
 
 ## 关键算法的代码实现
 
@@ -103,7 +103,7 @@ KL 直接加入 loss，组内优势只使用奖励 $r_i$。默认 $\beta=0$，�
 [train.py](train.py) 的 `main` 按以下顺序处理每个全局采样批次：
 
 1. 取出一批题目，分配给各进程；同一道题的全部回答在同一进程采样。
-2. `rollout` 用更新前的策略为每题生成 $G$ 个回答，计算奖励、组内优势，并缓存旧策略和可选 reference 的逐 token logprob。
+2. `rollout` 用更新前的策略为每题生成 $`G`$ 个回答，计算奖励、组内优势，并缓存旧策略和可选 reference 的逐 token logprob。
 3. `should_update` 汇总全局优势信号，决定本批是否更新。
 4. `update_policy` 对这些回答重新计算当前策略 logprob，计算 clipped loss 和可选 KL，累积梯度并更新 LoRA。
 5. 同批可重复更新 `updates_per_batch` 次，随后用更新后的策略采样下一批；按 `eval_every` 定期评测。
@@ -122,7 +122,7 @@ if should_update(samples, args.beta, fabric):
 
 ### Rollout：从题目到训练样本
 
-`rollout` 的输入是本进程的题目列表 `rows`，输出是回答记录列表 `samples`。若本进程有 $B$ 道题，输出就有 $B\times G$ 条记录。先将所有题目编码为 prompts，一次生成 $B\times G$ 个回答，再按每题 $G$ 条还原分组：
+`rollout` 的输入是本进程的题目列表 `rows`，输出是回答记录列表 `samples`。若本进程有 $`B`$ 道题，输出就有 $`B\times G`$ 条记录。先将所有题目编码为 prompts，一次生成 $`B\times G`$ 个回答，再按每题 $`G`$ 条还原分组：
 
 ```python
 prompts = [prompt_ids(tokenizer, row["question"]) for row in rows]
@@ -135,7 +135,7 @@ for i, (row, prompt) in enumerate(zip(rows, prompts, strict=True)):
     advantages = group_advantages([score["reward"] for score in scores])
 ```
 
-`generate` 将不同长度的 prompt 左侧补齐，使用 attention mask 屏蔽 padding。`num_return_sequences=G` 在生成器内按题展开，形成 $B\times G$ 条序列。所有回答从补齐后的输入宽度开始切片，保留首个 EOS 并删除后续 padding。返回的原始回答 token 用于概率计算，解码文本用于判分；优势只在同一道题内标准化。
+`generate` 将不同长度的 prompt 左侧补齐，使用 attention mask 屏蔽 padding。`num_return_sequences=G` 在生成器内按题展开，形成 $`B\times G`$ 条序列。所有回答从补齐后的输入宽度开始切片，保留首个 EOS 并删除后续 padding。返回的原始回答 token 用于概率计算，解码文本用于判分；优势只在同一道题内标准化。
 
 采样设置为 temperature=1、top-p=1、top-k=0、repetition penalty=1，模型和 LoRA 的 dropout 均为 0。批量采样会改变随机数消耗顺序，同一个 seed 不保证与逐题采样生成相同文本。
 
@@ -241,7 +241,7 @@ grad_norm = fabric.clip_gradients(model, optimizer, max_norm=args.max_grad_norm)
 optimizer.step()
 ```
 
-奖励全相同的组仍保留在损失分母中。`should_update` 汇总全局优势信号：当整批优势均为零且 $\beta=0$ 时跳过更新，避免 Adam 的历史动量继续改变参数。默认每批更新一次；`--updates-per-batch` 可在固定旧概率下重复更新。
+奖励全相同的组仍保留在损失分母中。`should_update` 汇总全局优势信号：当整批优势均为零且 $`\beta=0`$ 时跳过更新，避免 Adam 的历史动量继续改变参数。默认每批更新一次；`--updates-per-batch` 可在固定旧概率下重复更新。
 
 ## 运行方法
 

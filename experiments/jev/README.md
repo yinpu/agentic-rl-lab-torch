@@ -43,7 +43,7 @@ system 提示词要求用符号作答，user 提示词包含状态和决策 sche
 
 ### 训练：marker 位置的全词表交叉熵
 
-设第 $f$ 个字段的 marker 下标为 $m_f$，正确候选符号为 $y_f$。因果语言模型使用位置 $m_f-1$ 的 logits 预测它：
+设第 $`f`$ 个字段的 marker 下标为 $`m_f`$，正确候选符号为 $`y_f`$。因果语言模型使用位置 $`m_f-1`$ 的 logits 预测它：
 
 $$
 \ell_f=-\log\frac{\exp z_{m_f-1,y_f}}{\sum_{v\in V}\exp z_{m_f-1,v}},
@@ -51,11 +51,11 @@ $$
 L=\frac{1}{\sum_i|F_i|}\sum_i\sum_{f\in F_i}\ell_{i,f}.
 $$
 
-训练 softmax 的分母覆盖完整词表，只在 marker 的预测位置计算监督损失。全局 batch 内每个字段等权，因此五字段案例贡献五项损失，单字段案例贡献一项。这里 $V$ 是完整词表，$F_i$ 是第 $i$ 条案例的字段集合，$z$ 是模型输出的未归一化分数。marker 留在输入中，标签则是正确候选符号；prompt、骨架文本和 padding 均不作为训练目标。
+训练 softmax 的分母覆盖完整词表，只在 marker 的预测位置计算监督损失。全局 batch 内每个字段等权，因此五字段案例贡献五项损失，单字段案例贡献一项。这里 $`V`$ 是完整词表，$`F_i`$ 是第 $`i`$ 条案例的字段集合，$`z`$ 是模型输出的未归一化分数。marker 留在输入中，标签则是正确候选符号；prompt、骨架文本和 padding 均不作为训练目标。
 
 ### 推理：候选内归一化
 
-推理使用同一骨架，一次前向提取所有字段的候选 logits。对于候选集合 $C_f$ 和温度 $T\gt 0$：
+推理使用同一骨架，一次前向提取所有字段的候选 logits。对于候选集合 $`C_f`$ 和温度 $`T\gt 0`$：
 
 $$
 p_f(c;T)=\frac{\exp(z_{m_f-1,c}/T)}{\sum_{c'\in C_f}\exp(z_{m_f-1,c'}/T)}.
@@ -65,7 +65,7 @@ $$
 | --- | --- |
 | `choice` | 候选概率分布、最大概率选项 |
 | `noul` | no/yes 概率、`p_yes`、二选一结果；平局选 yes |
-| `score` | 等级概率、最大概率等级、期望分 $\sum_c\mathrm{value}(c)p_f(c)$ |
+| `score` | 等级概率、最大概率等级、期望分 $`\sum_c\mathrm{value}(c)p_f(c)`$ |
 
 温度校准在 calibration 划分上最小化字段平均 NLL：
 
@@ -75,7 +75,7 @@ $$
 
 推理的分母只包含本字段允许的候选，因此输出的是限制在候选集合内的条件分布；训练仍使用全词表分母，让正确符号相对所有词表 token 得分更高。候选内概率不会反映模型分给候选之外 token 的总概率。
 
-温度校准只拟合一个正数 $T$，不更新模型参数。$T\gt 1$ 使分布更平缓，$0\lt T\lt 1$ 使分布更尖锐；正温度保持 argmax，但会改变置信度和等级期望分。校准集用于拟合温度，测试集只用于最终评测，二者不能混用。
+温度校准只拟合一个正数 $`T`$，不更新模型参数。$`T\gt 1`$ 使分布更平缓，$`0\lt T\lt 1`$ 使分布更尖锐；正温度保持 argmax，但会改变置信度和等级期望分。校准集用于拟合温度，测试集只用于最终评测，二者不能混用。
 
 任务、切分、提示词和决策机制参考 [PyTrio-Jev 章节](https://github.com/datawhalechina/agentic-rl-lab/tree/8493321013c02eef6cf79ca2594811f53c6fdac1/experiments/pytrio-jev)。参考章使用 Qwen3.5-4B，本章默认使用 0.8B，并直接从本地模型取得全部候选 logits；参考服务通过 top-k logprobs 近似候选概率。改编代码与模板的许可证见 [LICENSE.upstream](LICENSE.upstream)。
 
@@ -162,7 +162,7 @@ decisions = build_decisions(record, logits, temperature)
 
 校准复用同一个 `candidate_logits`，将每个字段的 `(候选 logits, 正确候选下标)` 收集到 `instances`，随后调用 `fit_temperature(instances)`。模型权重保持固定，只拟合供 `build_decisions` 使用的温度。
 
-[evaluate.py](evaluate.py) 的 `fit_temperature` 使用逆温度 $\beta=1/T$。NLL 对 $\beta$ 凸，导数为 $\mathbb{E}_{p_\beta}[z]-z_{\mathrm{gold}}$，对应：
+[evaluate.py](evaluate.py) 的 `fit_temperature` 使用逆温度 $`\beta=1/T`$。NLL 对 $`\beta`$ 凸，导数为 $`\mathbb{E}_{p_\beta}[z]-z_{\mathrm{gold}}`$，对应：
 
 ```python
 def derivative(beta):
@@ -170,7 +170,7 @@ def derivative(beta):
                for z, y in instances) / len(instances)
 ```
 
-函数在 $\beta\in[0.01,100]$ 内二分求导数零点，最优点超出区间时取边界。校准结果绑定基础模型和 adapter，评测时检查匹配关系。
+函数在 $`\beta\in[0.01,100]`$ 内二分求导数零点，最优点超出区间时取边界。校准结果绑定基础模型和 adapter，评测时检查匹配关系。
 
 ## 运行方法
 
@@ -286,7 +286,7 @@ python experiments/jev/evaluate.py eval --model "$JEV_MODEL" \
 
 - accuracy：字段命中率，score 使用最大概率等级。
 - ECE：以最大候选概率作为置信度，使用 10 个等宽分桶。
-- Brier：每字段对全部候选求 $(p-\mathrm{onehot}_{\mathrm{gold}})^2$ 之和，再跨字段平均。
+- Brier：每字段对全部候选求 $`(p-\mathrm{onehot}_{\mathrm{gold}})^2`$ 之和，再跨字段平均。
 - NLL：正确候选的负对数概率。
 - 五项宏平均准确率：各基准 accuracy 的算术平均。
 
