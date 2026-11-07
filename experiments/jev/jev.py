@@ -9,7 +9,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import re
 from pathlib import Path
 
 import torch
@@ -102,7 +101,13 @@ def compile_record(record: dict, include_targets: bool = True) -> dict:
         f"## State\n{state}\n"
         "## Decision schema\n" + "\n".join(schema_lines)
     )
-    skeleton = json.dumps(dict.fromkeys(fields, MARKER), ensure_ascii=False, indent=4)
+    # 每个片段结束在 value 的左引号处；片段之间直接插入 marker token。
+    skeleton_parts = []
+    for i, field in enumerate(fields):
+        separator = "{\n" if i == 0 else '",\n'
+        skeleton_parts.append(separator + "    " + json.dumps(field, ensure_ascii=False) + ': "')
+    skeleton_parts.append('"\n}')
+    skeleton = MARKER.join(skeleton_parts)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_text},
@@ -110,6 +115,7 @@ def compile_record(record: dict, include_targets: bool = True) -> dict:
     ]
     return {
         "messages": messages,
+        "skeleton_parts": skeleton_parts,
         "fields": fields,
         "options": options,
         "targets": targets if include_targets else None,
@@ -117,7 +123,7 @@ def compile_record(record: dict, include_targets: bool = True) -> dict:
 
 
 class Encoder:
-    """绑定 tokenizer 与钉死的 chat template，负责 tokenization 和 marker 定位。"""
+    """绑定 tokenizer 与固定 chat template，分段编码并直接插入 marker token。"""
 
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
@@ -136,32 +142,9 @@ class Encoder:
             raise ValueError("answer symbols must have distinct token IDs")
 
     def encode(self, record: dict, include_targets: bool = True) -> dict:
-        """渲染完整训练/推理文本，返回 token ids 与各字段的 marker 索引。
-
-        marker 索引靠"prefix 之外、骨架之内"定位，不扫全文，因此 instructions 或
-        state 里出现单词 decision 也不会误判。
-        """
+        """训练/推理共用分段编码；插入 marker 时记录位置，不依赖上下文分词。"""
         compiled = compile_record(record, include_targets)
         messages = compiled["messages"]
-        ids = self.tokenizer.encode(
-            self.tokenizer.apply_chat_template(
-                messages, chat_template=self.template, tokenize=False
-            ),
-            add_special_tokens=False,
-        )
-        prefix_ids = self.tokenizer.encode(
-            self.tokenizer.apply_chat_template(
-                messages[:-1],
-                chat_template=self.template,
-                tokenize=False,
-                add_generation_prompt=True,
-            ),
-            add_special_tokens=False,
-        )
-        if ids[:len(prefix_ids)] != prefix_ids:
-            raise ValueError("prefix/skeleton 边界 tokenization 不稳定")
-        # 按 JSON value 的字符范围定位；字段名、state 中的 decision 不参与匹配。
-        # offset_mapping 与实际整段 tokenization 一致，也能处理引号和转义字段名。
         text = self.tokenizer.apply_chat_template(
             messages, chat_template=self.template, tokenize=False
         )
@@ -169,21 +152,15 @@ class Encoder:
             messages[:-1], chat_template=self.template, tokenize=False,
             add_generation_prompt=True,
         )
-        tokenized = self.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
-        if tokenized["input_ids"] != ids:
-            raise ValueError("offset tokenization differs from model input")
-        spans = [
-            (len(prefix) + m.start(1), len(prefix) + m.end(1))
-            for m in re.finditer(r': "(decision)"', messages[-1]["content"])
-        ]
-        if len(spans) != len(compiled["fields"]):
-            raise ValueError("JSON marker count mismatch")
+        suffix = text[len(prefix) + len(messages[-1]["content"]):]
+        ids = self.tokenizer.encode(prefix, add_special_tokens=False)
         markers = {}
-        for field, span in zip(compiled["fields"], spans, strict=True):
-            hits = [i for i, offset in enumerate(tokenized["offset_mapping"]) if tuple(offset) == span]
-            if len(hits) != 1 or ids[hits[0]] != self.marker_id:
-                raise ValueError(f"{field}: marker is not a standalone token in context")
-            markers[field] = hits[0]
+        parts = compiled["skeleton_parts"]
+        for field, part in zip(compiled["fields"], parts[:-1], strict=True):
+            ids.extend(self.tokenizer.encode(part, add_special_tokens=False))
+            markers[field] = len(ids)
+            ids.append(self.marker_id)
+        ids.extend(self.tokenizer.encode(parts[-1] + suffix, add_special_tokens=False))
         return {
             **compiled,
             "ids": ids,

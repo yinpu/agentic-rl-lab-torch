@@ -35,7 +35,7 @@ system 提示词要求用符号作答，user 提示词包含状态和决策 sche
 }
 ```
 
-`decision` 是 tokenizer 已有的单 token，占据各字段的决策位置。训练和推理共用 [固定模板](templates/qwen3_5_jev.jinja)，assistant 前包含空的 `<think>` 块。输入始终保留占位符，后面的字段看到的是前面字段的占位符。
+`decision` 是 tokenizer 已有的单 token，占据各字段的决策位置。普通文本分段编码，marker 直接以 token ID 插入，不与字段名或引号一起分词。训练和推理共用这一编码方式及 [固定模板](templates/qwen3_5_jev.jinja)，assistant 前包含空的 `<think>` 块。输入始终保留占位符，后面的字段看到的是前面字段的占位符。
 
 ### 训练：marker 位置的全词表交叉熵
 
@@ -104,7 +104,16 @@ for epoch in range(args.epochs):
 
 ### 编码与 marker 定位
 
-[jev.py](jev.py) 的 `compile_record` 将候选映射为符号，`Encoder` 验证符号均为不同的单 token，并通过 JSON value 的字符范围定位 marker。`build_example` 将各字段的预测位置设为 `marker_index - 1`，标签设为正确符号的 token ID。
+[jev.py](jev.py) 的 `compile_record` 将候选映射为符号，并生成以各字段 marker 为边界的 JSON 骨架片段；字段名由 `json.dumps` 转义。`Encoder` 验证候选符号均为不同的单 token，先编码提示词，再依次编码骨架片段、插入 `marker_id`，最后编码骨架结尾与模板后缀。插入 marker 时，当前 token 序列长度就是它的位置：
+
+```python
+for field, part in zip(compiled["fields"], parts[:-1], strict=True):
+    ids.extend(self.tokenizer.encode(part, add_special_tokens=False))
+    markers[field] = len(ids)
+    ids.append(self.marker_id)
+```
+
+`build_example` 将各字段的预测位置设为 `marker_index - 1`，标签设为正确符号的 token ID。推理也调用同一个 `Encoder.encode`，但不读取训练标签。相较参考章对整段文本一次分词，这里显式固定 marker 的 token 边界；分段拼接后的 token 序列可能不同，解码后仍是同一份模板文本。
 
 `decision_logits` 复用 `batch_decision_logits`：批量右侧补齐，用 attention mask 标记有效输入，将各案例 marker 前一位置合并为 `selected`：
 

@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from experiments.jev.evaluate import adapt_jevbench, fit_temperature, mean_nll, metrics
-from experiments.jev.jev import (ANSWER_SYMBOLS, Encoder, build_decisions, compile_record,
+from experiments.jev.jev import (ANSWER_SYMBOLS, MARKER, Encoder, build_decisions, compile_record,
                                  decision_logits, normalize_label)
 from experiments.jev.prepare_data import convert_toolace, convert_typed_decisions
 
@@ -41,12 +41,16 @@ def test_candidate_limits(record):
         compile_record(record)
 
 
-def test_real_tokenizer_marker_and_template(record):
+@pytest.fixture
+def tokenizer():
     from transformers import AutoTokenizer
     path = Path(__file__).resolve().parents[2] / ".cache/models/Qwen3.5-0.8B"
     if not (path / "tokenizer.json").exists():
         pytest.skip("local Qwen3.5-0.8B tokenizer absent")
-    tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True)
+    return AutoTokenizer.from_pretrained(path, local_files_only=True)
+
+
+def test_real_tokenizer_marker_and_template(record, tokenizer):
     encoder = Encoder(tokenizer)
     encoded = encoder.encode(record)
     example = encoder.build_example(record)
@@ -58,6 +62,9 @@ def test_real_tokenizer_marker_and_template(record):
     messages = encoded["messages"]
     assert tokenizer.apply_chat_template(messages, tokenize=False) == tokenizer.apply_chat_template(
         messages, chat_template=encoder.template, tokenize=False)
+    assert tokenizer.decode(encoded["ids"], clean_up_tokenization_spaces=False) == tokenizer.apply_chat_template(
+        messages, chat_template=encoder.template, tokenize=False)
+    assert json.loads(messages[-1]["content"]) == dict.fromkeys(record["questions"], MARKER)
     with pytest.raises(ValueError, match="exceeds"):
         encoder.build_example(record, max_length=20)
     # 全部 62 个候选，确保小写和数字也能监督。
@@ -65,6 +72,34 @@ def test_real_tokenizer_marker_and_template(record):
                                    "criteria": {str(i): str(i) for i in range(62)}}}
     record["targets"] = {"many": {"label": "61"}}
     assert encoder.build_example(record)["targets"] == [encoder.symbol_token_id(ANSWER_SYMBOLS[-1])]
+
+
+@pytest.mark.parametrize("merged_text", ['"情感": "decision"', '"decision"'])
+def test_marker_stays_separate_when_context_has_a_merged_token(record, tokenizer, merged_text):
+    # 在测试词表中构造用户担心的整段 token；生产编码不扩展词表。
+    tokenizer.add_tokens([merged_text])
+    merged_id = tokenizer.convert_tokens_to_ids(merged_text)
+    assert tokenizer.encode(merged_text, add_special_tokens=False) == [merged_id]
+    for field in ["情感", '转义"\\\n🧪decision']:
+        record["questions"][field] = deepcopy(record["questions"]["decision"])
+        record["targets"][field] = {"label": "a"}
+    encoder = Encoder(tokenizer)
+    encoded = encoder.encode(record)
+    rendered = tokenizer.apply_chat_template(encoded["messages"], chat_template=encoder.template, tokenize=False)
+    assert merged_id in tokenizer.encode(rendered, add_special_tokens=False)
+    assert tokenizer.decode(encoded["ids"], clean_up_tokenization_spaces=False) == rendered
+    for index in encoded["markers"].values():
+        assert encoded["ids"][index] == encoder.marker_id
+        assert tokenizer.decode(encoded["ids"][:index], clean_up_tokenization_spaces=False).endswith(': "')
+        assert tokenizer.decode(encoded["ids"][index + 1:], clean_up_tokenization_spaces=False).startswith('"')
+    inference_record = deepcopy(record)
+    inference_record.pop("targets")
+    inference = encoder.encode(inference_record, include_targets=False)
+    assert inference["ids"] == encoded["ids"]
+    assert inference["markers"] == encoded["markers"]
+    example = encoder.build_example(record)
+    assert example["positions"] == [i - 1 for i in encoded["markers"].values()]
+    assert example["targets"] == [encoder.symbol_token_id("B")] * len(record["questions"])
 
 
 def test_sparse_logits_matches_full_vocab_shifted_ce():
