@@ -9,6 +9,7 @@
 | 章节 | 任务与模型 | 内容 |
 | --- | --- | --- |
 | [GRPO](experiments/grpo/README.md) | GSM8K / Qwen2.5-0.5B Base | 显式采样、组内优势、clipped loss、LoRA、可选 KL 与格式奖励 |
+| [General OPD](experiments/general-opd/README.md) | DeepMath-103K / Qwen3.5-4B ← Qwen3.6-27B | 同步在线蒸馏、token 优势、LoRA、独立数学评测 |
 | [Jev 决策模型](experiments/jev/README.md) | Typed Decisions + ToolACE / Qwen3.5-0.8B | marker masked SFT、一次前向决策、温度校准、五项基准评测 |
 
 GRPO 使用 Transformers、PEFT 和 Lightning Fabric，核心算法直接写在本章代码中。训练与评测共用提示词和答案判定，支持单卡运行与 `torchrun` DDP 启动。
@@ -16,6 +17,8 @@ GRPO 使用 Transformers、PEFT 和 Lightning Fabric，核心算法直接写在�
 GRPO 使用 `--micro-batch-size` 调整每进程训练前向的样本数，默认 1。JEV 使用 `--per-device-train-batch-size`（默认 1）与 `--gradient-accumulation-steps`（默认 16），全局 batch 为单卡 batch × 梯度累积次数 × 卡数。
 
 Jev 使用较小的 Qwen3.5-0.8B，通过 LoRA masked SFT 学习有限候选决策；保留参考章的原任务与数据切分，训练、推理、校准和评测均在本地运行。完整流程见 [第二节教程](experiments/jev/README.md)。
+
+General OPD 使用 Qwen3.5-4B 学生和 Qwen3.6-27B 教师，在 DeepMath 上进行逐 token 在线蒸馏，并对固定留出集评测。
 
 ## 开始使用
 
@@ -28,7 +31,7 @@ cd agentic-rl-lab-torch
 
 ## 测试
 
-测试集中在根目录 `tests/`，按 `grpo/`、`jev/` 分组；章节目录保留教程与实验代码。从仓库根目录运行：
+测试集中在根目录 `tests/`，按 `grpo/`、`jev/`、`general-opd/` 分组；章节目录保留教程与实验代码。从仓库根目录运行：
 
 ```bash
 .venv/bin/python -m pytest -q
@@ -39,4 +42,5 @@ cd agentic-rl-lab-torch
 ```bash
 .venv/bin/torchrun --standalone --nproc_per_node=2 tests/grpo/check_ddp.py
 .venv/bin/torchrun --standalone --nproc_per_node=2 tests/jev/check_ddp.py
+.venv/bin/torchrun --standalone --nproc_per_node=2 tests/general-opd/check_ddp.py
 ```
