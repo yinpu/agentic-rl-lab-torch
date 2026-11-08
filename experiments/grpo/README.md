@@ -1,5 +1,7 @@
 # GRPO：GSM8K 上的 LoRA 强化学习
 
+通过本次 GRPO + LoRA 实验，我们仅更新 LoRA 参数，就将 **Qwen2.5-0.5B Base 在 GSM8K 测试集上的准确率从 21.5% 提高至最高 51.4%，提升 29.9 个百分点**。该结果来自同时启用 KL 约束与格式奖励的配置，在全部 1319 道测试题上使用贪心解码、1024 token 生成上限评测。本章通过四组对照实验，带你理解奖励如何驱动策略更新，以及 KL 约束和格式奖励如何影响答题准确率、回答长度与截断率。
+
 ## 算法原理
 
 GRPO 对同一道题采样多个回答，用组内奖励差异估计优势，再通过裁剪概率比更新策略。本章在 GSM8K 上训练 Qwen2.5-0.5B Base，比较正确性奖励、reference KL 和格式奖励的影响。
@@ -322,15 +324,23 @@ rollout 一次生成每进程 `batch-size × group-size` 条回答；`micro-batc
 ```bash
 .venv/bin/python experiments/grpo/train.py \
   --output experiments/grpo/runs/qwen05-baseline --eval-limit 0 \
+  --batch-size 4 --group-size 8 --max-tokens 512 \
+  --eval-batch-size 64 --micro-batch-size 2 \
   --beta 0 --format-reward-weight 0
 .venv/bin/python experiments/grpo/train.py \
   --output experiments/grpo/runs/qwen05-kl --eval-limit 0 \
+  --batch-size 4 --group-size 8 --max-tokens 512 \
+  --eval-batch-size 64 --micro-batch-size 2 \
   --beta 0.04 --format-reward-weight 0
 .venv/bin/python experiments/grpo/train.py \
   --output experiments/grpo/runs/qwen05-format --eval-limit 0 \
+  --batch-size 4 --group-size 8 --max-tokens 512 \
+  --eval-batch-size 64 --micro-batch-size 2 \
   --beta 0 --format-reward-weight 0.5
 .venv/bin/python experiments/grpo/train.py \
   --output experiments/grpo/runs/qwen05-kl-format --eval-limit 0 \
+  --batch-size 4 --group-size 8 --max-tokens 512 \
+  --eval-batch-size 64 --micro-batch-size 2 \
   --beta 0.04 --format-reward-weight 0.5
 ```
 
@@ -361,4 +371,51 @@ rollout 一次生成每进程 `batch-size × group-size` 条回答；`micro-batc
 
 ## 实验结果与分析
 
-TODO
+### 实验设置与指标
+
+本次实验采用上面的四组对照：baseline 仅使用正确性奖励，kl 加入系数为 0.04 的 reference KL，format 加入权重为 0.5 的格式奖励，kl-format 同时启用两项。共同训练参数为 `--batch-size 4 --group-size 8 --max-tokens 512 --eval-limit 0 --eval-batch-size 64 --micro-batch-size 2`。每进程每批采样 4 道题、每题 8 条回答；概率计算的 micro-batch 为 2 条回答，不改变每批回答的权重。
+
+训练的 512 token 上限只约束 rollout；验证生成由 `--eval-max-tokens` 独立控制，默认上限为 1024，因此验证平均长度可以超过 512。测试使用 GSM8K 官方 test 的全部 1319 题，贪心解码，最多生成 1024 个 token。
+
+各指标均按题统计：accuracy 是最后一个 boxed 答案与标准答案匹配的比例，缺少 boxed 记为错误；boxed 格式率是能提取 boxed 答案的比例，不代表答案正确；think 格式率要求整个回答满足非空 `<think>...</think>` 块后紧跟 boxed 答案的完整结构。平均生成长度以回答 token 数计，包含生成出的 EOS；截断率表示生成到上限仍未遇到 EOS 的比例，截断回答仍参与准确率统计。
+
+### 验证集结果
+
+使用固定验证集，`--eval-limit 0` 表示评测全部验证题。训练前后结果如下；提升量均为绝对百分点。
+
+| 指标 | 训练前 | baseline | kl | format | kl-format |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| accuracy | 28.1% | 61.3% | **66.0%** | 60.5% | **66.0%** |
+| accuracy 相比训练前提升 | — | +33.2 | +37.9 | +32.4 | +37.9 |
+| boxed 格式率 | 55.5% | 98.4% | 99.6% | 95.7% | 98.4% |
+| 平均生成长度（token） | 300 | 702 | 277 | 328 | 288 |
+| 截断率 | 4.3% | 32.0% | 0.4% | 4.3% | 1.6% |
+| think 格式率 | 未提供 | 0% | 0% | 0% | 0% |
+
+四组准确率均高于训练前。无格式奖励时，加入 KL 对应的准确率提升为 4.7 个百分点；有格式奖励时为 5.5 个百分点。baseline 的平均长度从 300 增至 702，截断率升至 32.0%；其余三组的平均长度为 277–328，截断率为 0.4%–4.3%。因此，准确率提升需要结合输出长度和终止行为一起观察：baseline 虽然答对了更多题，但也更频繁地生成到长度上限。
+
+### 测试集结果
+
+| 指标 | 基础模型 | baseline | kl | format | kl-format |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| accuracy | 21.5% | 47.5% | 51.3% | 50.8% | **51.4%** |
+| accuracy 相比基础模型提升（百分点） | — | +26.0 | +29.8 | +29.3 | +29.9 |
+| boxed 格式率 | 58.0% | 97.9% | 98.3% | 96.7% | 97.6% |
+| 平均生成长度（token） | 303 | 746 | 288 | 320 | 297 |
+| 截断率 | 3.8% | 36.1% | 1.7% | 3.4% | 2.4% |
+
+测试集上，四组相对基础模型提高 26.0–29.9 个百分点。kl、format、kl-format 的准确率集中在 50.8%–51.4%，分别比 baseline 高 3.8、3.3、3.9 个百分点。baseline 的长输出和高截断现象也出现在测试集：平均生成 746 token，36.1% 的回答达到上限；kl 的对应数值为 288 token 和 1.7%，平均生成 token 数比 baseline 少约 61.4%。这体现了生成长度的差异，实际耗时仍需单独测量。
+
+对 1319 道题、准确率接近 50% 的单个模型，按二项比例近似计算的 accuracy 95% 置信区间约为点估计 ±2.7 个百分点。该区间反映有限测试题数带来的不确定性，不包含训练随机性，也不是两个模型准确率差值的置信区间。同一测试集上的模型比较需要逐题配对结果；当前汇总数据不足以判定组间差异的统计显著性，尤其不能仅凭 51.4% 与 51.3% 判定 kl-format 优于 kl。
+
+训练后四组测试准确率均低于验证准确率，差距为 9.7–14.7 个百分点；基础模型在两个集合上也已有 6.6 个百分点的差距。因此，验证集上的 66.0% 不能直接代表测试表现；仅凭不同题目集合的最终分数差异，也不足以诊断过拟合，需要结合训练曲线、模型选择过程及评测设置进一步判断。
+
+### KL、格式奖励与输出行为
+
+**KL 组在两个数据集上都兼顾了准确率和较低截断率。** 相比 baseline，kl 的验证与测试准确率分别提高 4.7 和 3.8 个百分点，长度与截断率同时下降。这个现象与 reference KL 约束策略偏离初始模型的作用一致，但仅凭最终汇总指标，不能确定准确率改善有多少来自终止行为变化，也不能把较长回答直接解释为更充分的推理或重复生成。后者需要检查逐题回答与训练曲线。
+
+**格式奖励的准确率收益在验证集和测试集上并不一致。** 不启用 KL 时，format 相对 baseline 在验证集下降 0.8 个百分点，在测试集提高 3.3 个百分点，并在两个数据集上都伴随更短输出、更少截断。启用 KL 后，额外加入格式奖励的验证准确率持平，测试准确率仅高 0.1 个百分点，而长度和截断率略高。当前结果没有显示组合配置相对单独 KL 的明确优势。
+
+**boxed 格式率提高，不等于学会了被奖励的 think 格式。** 正确性奖励本身要求答案出现在 boxed 中，因此即使不加入格式奖励，baseline 的 boxed 格式率也从验证集的 55.5% 升至 98.4%，从测试集的 58.0% 升至 97.9%。但四组训练后的验证 think 格式率均为 0%，说明在该贪心评测下，没有形成满足完整结构检查的输出；这不等于没有推理文字，也不能证明训练时的随机 rollout 从未获得格式奖励。要判断格式奖励是否提供了有效学习信号，应查看 rollout 中的 `think_format_rate`、`format_reward` 及合规样本；若同组所有回答的格式标记相同，格式奖励也不会产生额外的组内优势差异。
+
+综合本次结果，`beta=0.04、format-reward-weight=0` 可作为后续实验的优先配置：验证准确率并列最高，测试准确率接近最高，同时在四个训练后模型中，两套评测的平均长度和截断率均最低。后续重点是用多个训练 seed 检查这一趋势是否稳定，并结合逐题配对结果和训练期间的格式奖励触发情况，区分稳定收益、随机波动与奖励信号稀疏的影响。
