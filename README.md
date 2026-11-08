@@ -9,6 +9,8 @@
 | 章节 | 任务与模型 | 内容 |
 | --- | --- | --- |
 | [GRPO](experiments/grpo/README.md) | GSM8K / Qwen2.5-0.5B Base | 显式采样、组内优势、clipped loss、LoRA、可选 KL 与格式奖励 |
+| [DAPO](experiments/dapo/README.md) | DAPO-Math-17K / Qwen3.5-4B | 动态采样、非对称裁剪、token 等权损失、长度奖励、LoRA |
+| [GSPO](experiments/gspo/README.md) | DAPO-Math-17K / Qwen3.5-4B | 序列等权裁剪、固定旧策略、四个 mini-batch 更新、LoRA |
 | [General OPD](experiments/general-opd/README.md) | DeepMath-103K / Qwen3.5-4B ← Qwen3.6-27B | 同步在线蒸馏、token 优势、LoRA、独立数学评测 |
 | [Jev 决策模型](experiments/jev/README.md) | Typed Decisions + ToolACE / Qwen3.5-0.8B | marker masked SFT、一次前向决策、温度校准、五项基准评测 |
 
@@ -31,7 +33,7 @@ cd agentic-rl-lab-torch
 
 ## 测试
 
-测试集中在根目录 `tests/`，按 `grpo/`、`jev/`、`general-opd/` 分组；章节目录保留教程与实验代码。从仓库根目录运行：
+测试集中在根目录 `tests/`，按 `grpo/`、`jev/`、`general-opd/`、`dapo/`、`gspo/` 分组；章节目录保留教程与实验代码。从仓库根目录运行：
 
 ```bash
 .venv/bin/python -m pytest -q
@@ -40,6 +42,8 @@ cd agentic-rl-lab-torch
 真实模型 GPU 检查需要 CUDA 和本地缓存权重，否则自动跳过。两进程 CPU DDP 检查单独运行：
 
 ```bash
+.venv/bin/torchrun --standalone --nproc_per_node=2 tests/gspo/distributed_check.py
+.venv/bin/torchrun --standalone --nproc_per_node=2 tests/dapo/distributed_check.py
 .venv/bin/torchrun --standalone --nproc_per_node=2 tests/grpo/check_ddp.py
 .venv/bin/torchrun --standalone --nproc_per_node=2 tests/jev/check_ddp.py
 .venv/bin/torchrun --standalone --nproc_per_node=2 tests/general-opd/check_ddp.py

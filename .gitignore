@@ -5,3 +5,7 @@ __pycache__/
 .pytest_cache/
 *.pyc
 experiments/jev/datasets/
+
+experiments/dapo/datasets/
+
+experiments/gspo/datasets/
